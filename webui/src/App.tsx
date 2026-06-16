@@ -479,7 +479,15 @@ function AppContent({
     if (!task.files || task.files.length === 0) return [];
     
     const paths = task.files
-      .map(f => f.path)
+      .map(f => {
+        let p = f.path;
+        if (!p) return '';
+        // If it's a relative path (doesn't start with /downloads/ or /), prepend /downloads/
+        if (!p.startsWith('/downloads/') && !p.startsWith('/')) {
+          p = `/downloads/${p}`;
+        }
+        return p;
+      })
       .filter(p => p && p.startsWith('/downloads/'));
       
     if (paths.length === 0) return [];
