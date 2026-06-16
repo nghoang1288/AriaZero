@@ -54,18 +54,25 @@ def fetch_history():
             except Exception:
                 files = []
             try:
-                bittorrent = json.loads(r["bittorrent_json"]) if r["bittorrent_json"] else {}
+                bittorrent = json.loads(r["bittorrent_json"]) if r["bittorrent_json"] else None
+                if bittorrent == {}:
+                    bittorrent = None
             except Exception:
-                bittorrent = {}
+                bittorrent = None
                 
             result.append({
                 "gid": r["gid"],
                 "name": r["name"],
+                "totalLength": str(r["total_length"]),
+                "completedLength": str(r["completed_length"]),
                 "total_length": r["total_length"],
                 "completed_length": r["completed_length"],
                 "status": r["status"],
+                "errorCode": r["error_code"],
+                "errorMessage": r["error_message"],
                 "error_code": r["error_code"],
                 "error_message": r["error_message"],
+                "completedTime": r["completed_time"],
                 "completed_time": r["completed_time"],
                 "files": files,
                 "bittorrent": bittorrent,

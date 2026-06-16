@@ -37,19 +37,23 @@ export const isDoc = (ext: string) =>
 export const isSoftware = (ext: string) =>
   ['exe', 'msi', 'dmg', 'pkg', 'deb', 'rpm', 'apk', 'zip', 'rar', '7z', 'tar', 'gz'].includes(ext.toLowerCase());
 
-export const isTorrent = (task: Aria2Task) => !!task.bittorrent;
+export const isTorrent = (task: Aria2Task) => {
+  return !!task.bittorrent && Object.keys(task.bittorrent).length > 0;
+};
 
 // A task is seeding if it is active, is a torrent, and completedLength >= totalLength
 export const isTaskSeeding = (task: Aria2Task) => {
+  const hasBt = !!task.bittorrent && Object.keys(task.bittorrent).length > 0;
   return task.status === 'active' && 
-    !!task.bittorrent && 
+    hasBt && 
     Number(task.totalLength) > 0 && 
     Number(task.completedLength) >= Number(task.totalLength);
 };
 
 // A torrent is completed (can be seeding or seeding-paused/complete)
 export const isTorrentCompleted = (task: Aria2Task) => {
-  return !!task.bittorrent && 
+  const hasBt = !!task.bittorrent && Object.keys(task.bittorrent).length > 0;
+  return hasBt && 
     Number(task.totalLength) > 0 && 
     Number(task.completedLength) >= Number(task.totalLength);
 };
@@ -57,10 +61,11 @@ export const isTorrentCompleted = (task: Aria2Task) => {
 // Identify completed metadata tasks to hide them
 export const isMetadataTask = (task: Aria2Task) => {
   const name = getTaskName(task).toLowerCase();
+  const hasBt = !!task.bittorrent && Object.keys(task.bittorrent).length > 0;
   return name.includes('[metadata]') || 
          name.includes('metadata') ||
          (task as any).followedBy !== undefined ||
-         (!!task.bittorrent && !task.bittorrent.info);
+         (hasBt && !task.bittorrent?.info);
 };
 
 export function filterTaskByCategory(task: Aria2Task, category: string): boolean {
