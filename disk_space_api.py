@@ -7,8 +7,12 @@ import threading
 import time
 import urllib.request
 import urllib.error
+import hashlib
 
 DB_PATH = '/config/ariazero_history.db'
+
+hash_jobs = {}
+hash_jobs_lock = threading.Lock()
 
 def init_db():
     db_dir = os.path.dirname(DB_PATH)
@@ -175,9 +179,9 @@ def upsert_history_records(tasks):
                     name=excluded.name,
                     total_length=excluded.total_length,
                     completed_length=excluded.completed_length,
-                    status=excluded.status,
-                    error_code=excluded.error_code,
-                    error_message=excluded.error_message,
+                    status=CASE WHEN download_history.status = 'complete' THEN 'complete' ELSE excluded.status END,
+                    error_code=CASE WHEN download_history.status = 'complete' THEN download_history.error_code ELSE excluded.error_code END,
+                    error_message=CASE WHEN download_history.status = 'complete' THEN download_history.error_message ELSE excluded.error_message END,
                     files_json=excluded.files_json,
                     bittorrent_json=excluded.bittorrent_json
             ''', (gid, name, total_length, completed_length, status, error_code, error_message, now, files_json, bittorrent_json))
@@ -185,7 +189,116 @@ def upsert_history_records(tasks):
     finally:
         conn.close()
 
+def calculate_sha256_thread(file_path):
+    try:
+        sha256_hash = hashlib.sha256()
+        total_size = os.path.getsize(file_path)
+        read_size = 0
+        
+        with open(file_path, "rb") as f:
+            for byte_block in iter(lambda: f.read(8192 * 1024), b""): # 8MB chunks
+                sha256_hash.update(byte_block)
+                read_size += len(byte_block)
+                progress = int((read_size / total_size) * 100) if total_size > 0 else 100
+                with hash_jobs_lock:
+                    hash_jobs[file_path] = {
+                        "status": "processing",
+                        "progress": progress,
+                        "read_bytes": read_size,
+                        "total_bytes": total_size
+                    }
+                    
+        hash_hex = sha256_hash.hexdigest()
+        with hash_jobs_lock:
+            hash_jobs[file_path] = {
+                "status": "completed",
+                "progress": 100,
+                "hash": hash_hex,
+                "total_bytes": total_size
+            }
+    except Exception as e:
+        with hash_jobs_lock:
+            hash_jobs[file_path] = {
+                "status": "failed",
+                "error": str(e)
+            }
+
+def get_active_aria2_paths():
+    active_paths = set()
+    success = False
+    try:
+        secret = os.environ.get('ARIA2_RPC_SECRET')
+        aria2_port = os.environ.get('ARIA2_RPC_PORT', '6800')
+        url = f"http://127.0.0.1:{aria2_port}/jsonrpc"
+        headers = {"Content-Type": "application/json"}
+        
+        methods = ["aria2.tellActive", "aria2.tellWaiting", "aria2.tellStopped"]
+        rpc_success_count = 0
+        for method in methods:
+            params = [f"token:{secret}"] if secret else []
+            if method in ["aria2.tellWaiting", "aria2.tellStopped"]:
+                params.extend([0, 1000])
+            params.append(["gid", "status", "files", "dir", "bittorrent"])
+            
+            payload = {
+                "jsonrpc": "2.0",
+                "id": "ariazero_cleanup_poller",
+                "method": method,
+                "params": params
+            }
+            req_data = json.dumps(payload).encode('utf-8')
+            req = urllib.request.Request(url, data=req_data, headers=headers, method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=5) as response:
+                    resp_data = json.loads(response.read().decode('utf-8'))
+                    if "result" in resp_data:
+                        tasks = resp_data["result"]
+                        rpc_success_count += 1
+                        if isinstance(tasks, list):
+                            for task in tasks:
+                                status = task.get("status")
+                                if status in ["active", "waiting", "paused", "error"]:
+                                    files = task.get("files", [])
+                                    for f in files:
+                                        path = f.get("path")
+                                        if path:
+                                            active_paths.add(os.path.realpath(path + ".aria2"))
+                                    bt = task.get("bittorrent", {})
+                                    if bt and isinstance(bt, dict):
+                                        info = bt.get("info", {})
+                                        name = info.get("name") if isinstance(info, dict) else None
+                                        directory = task.get("dir")
+                                        if name and directory:
+                                            active_paths.add(os.path.realpath(os.path.join(directory, name + ".aria2")))
+                                            active_paths.add(os.path.realpath(os.path.join(directory, name + ".torrent.aria2")))
+            except Exception:
+                pass
+        
+        if rpc_success_count > 0:
+            success = True
+    except Exception:
+        pass
+    return success, active_paths
+
+def cleanup_orphaned_aria2_files():
+    success, active_paths = get_active_aria2_paths()
+    if not success:
+        return
+        
+    downloads_dir = os.path.realpath("/downloads")
+    for root, dirs, files in os.walk(downloads_dir):
+        for file in files:
+            if file.endswith(".aria2"):
+                file_path = os.path.realpath(os.path.join(root, file))
+                if file_path not in active_paths:
+                    try:
+                        os.remove(file_path)
+                        print(f"Cleaned up orphaned control file: {file_path}")
+                    except Exception:
+                        pass
+
 def background_poller():
+    cleanup_counter = 0
     while True:
         try:
             secret = os.environ.get('ARIA2_RPC_SECRET')
@@ -208,6 +321,11 @@ def background_poller():
                     tasks = resp_data["result"]
                     if isinstance(tasks, list):
                         upsert_history_records(tasks)
+                        
+            cleanup_counter += 1
+            if cleanup_counter >= 5:
+                cleanup_counter = 0
+                cleanup_orphaned_aria2_files()
         except Exception as e:
             pass
             
@@ -283,6 +401,37 @@ class DiskSpaceHandler(BaseHTTPRequestHandler):
                 self._send_cors_headers()
                 self.end_headers()
                 self.wfile.write(json.dumps(records).encode('utf-8'))
+            except Exception as e:
+                self.send_response(500)
+                self.send_header('Content-Type', 'application/json')
+                self._send_cors_headers()
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
+        elif self.path.startswith('/api/file-hash/status'):
+            if not self.check_auth():
+                return
+            try:
+                from urllib.parse import urlparse, parse_qs
+                query = parse_qs(urlparse(self.path).query)
+                path_list = query.get('path')
+                file_path = path_list[0] if path_list else None
+                
+                if not file_path:
+                    self.send_response(400)
+                    self.send_header('Content-Type', 'application/json')
+                    self._send_cors_headers()
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": "Missing path parameter"}).encode('utf-8'))
+                    return
+                    
+                with hash_jobs_lock:
+                    job = hash_jobs.get(file_path, {"status": "not_started"})
+                    
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self._send_cors_headers()
+                self.end_headers()
+                self.wfile.write(json.dumps(job).encode('utf-8'))
             except Exception as e:
                 self.send_response(500)
                 self.send_header('Content-Type', 'application/json')
@@ -423,6 +572,70 @@ class DiskSpaceHandler(BaseHTTPRequestHandler):
                 self._send_cors_headers()
                 self.end_headers()
                 self.wfile.write(json.dumps({"success": True}).encode('utf-8'))
+            except Exception as e:
+                self.send_response(500)
+                self.send_header('Content-Type', 'application/json')
+                self._send_cors_headers()
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
+        elif self.path == '/api/file-hash':
+            if not self.check_auth():
+                return
+            try:
+                content_length_str = self.headers.get('Content-Length')
+                content_length = int(content_length_str) if content_length_str else 0
+                if content_length > 1048576:
+                    self.send_response(413)
+                    self.send_header('Content-Type', 'application/json')
+                    self._send_cors_headers()
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": "Payload too large"}).encode('utf-8'))
+                    return
+                    
+                post_data = self.rfile.read(content_length)
+                req_data = json.loads(post_data.decode('utf-8'))
+                file_path = req_data.get("path")
+                
+                if not file_path:
+                    self.send_response(400)
+                    self.send_header('Content-Type', 'application/json')
+                    self._send_cors_headers()
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": "Missing path"}).encode('utf-8'))
+                    return
+                    
+                # Security check
+                downloads_dir = os.path.realpath("/downloads")
+                real_path = os.path.realpath(file_path)
+                if not real_path.startswith(downloads_dir):
+                    self.send_response(403)
+                    self.send_header('Content-Type', 'application/json')
+                    self._send_cors_headers()
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": "Forbidden path"}).encode('utf-8'))
+                    return
+                    
+                if not os.path.exists(real_path) or os.path.isdir(real_path):
+                    self.send_response(404)
+                    self.send_header('Content-Type', 'application/json')
+                    self._send_cors_headers()
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": "File not found"}).encode('utf-8'))
+                    return
+                
+                with hash_jobs_lock:
+                    job = hash_jobs.get(real_path)
+                    if not job or job.get("status") in ["failed", "completed"]:
+                        hash_jobs[real_path] = {"status": "processing", "progress": 0}
+                        t = threading.Thread(target=calculate_sha256_thread, args=(real_path,), daemon=True)
+                        t.start()
+                        job = hash_jobs[real_path]
+                        
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self._send_cors_headers()
+                self.end_headers()
+                self.wfile.write(json.dumps(job).encode('utf-8'))
             except Exception as e:
                 self.send_response(500)
                 self.send_header('Content-Type', 'application/json')

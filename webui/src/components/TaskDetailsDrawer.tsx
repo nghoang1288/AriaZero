@@ -74,6 +74,82 @@ export default function TaskDetailsDrawer({
     }
   };
 
+  const [hashStatuses, setHashStatuses] = useState<Record<string, { status: string; progress?: number; hash?: string; error?: string }>>({});
+
+  const verifyFileHash = async (filePath: string) => {
+    if (!filePath) return;
+    
+    setHashStatuses(prev => ({
+      ...prev,
+      [filePath]: { status: 'starting', progress: 0 }
+    }));
+    
+    try {
+      const secret = (window as any).AriaZeroServerConfig?.rpcSecret || '';
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json'
+      };
+      if (secret) {
+        headers['Authorization'] = `Bearer ${secret}`;
+      }
+      
+      const getApiUrl = (path: string): string => {
+        if (location.port === '5173') {
+          return `http://192.168.50.226:16980/api/${path}`;
+        }
+        const protocol = location.protocol === 'https:' ? 'https' : 'http';
+        const port = location.port ? `:${location.port}` : '';
+        return `${protocol}://${location.hostname}${port}/api/${path}`;
+      };
+
+      const res = await fetch(getApiUrl('file-hash'), {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ path: filePath })
+      });
+      
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.error || 'Failed to start hash check');
+      }
+      
+      const data = await res.json();
+      setHashStatuses(prev => ({
+        ...prev,
+        [filePath]: data
+      }));
+      
+      const pollInterval = setInterval(async () => {
+        try {
+          const statusRes = await fetch(getApiUrl(`file-hash/status?path=${encodeURIComponent(filePath)}`), {
+            headers
+          });
+          if (statusRes.ok) {
+            const statusData = await statusRes.json();
+            setHashStatuses(prev => ({
+              ...prev,
+              [filePath]: statusData
+            }));
+            
+            if (statusData.status === 'completed' || statusData.status === 'failed') {
+              clearInterval(pollInterval);
+            }
+          } else {
+            clearInterval(pollInterval);
+          }
+        } catch (pollErr) {
+          clearInterval(pollInterval);
+        }
+      }, 1000);
+      
+    } catch (err: any) {
+      setHashStatuses(prev => ({
+        ...prev,
+        [filePath]: { status: 'failed', error: err.message || 'Error occurred' }
+      }));
+    }
+  };
+
   // Convert hex bitfield to binary array
   const hexCharToBin = (char: string): string => {
     const num = parseInt(char, 16);
@@ -225,6 +301,9 @@ export default function TaskDetailsDrawer({
               const parts = file.path.split(/[/\\]/);
               const fName = parts[parts.length - 1] || file.uris?.[0]?.uri || `File ${i + 1}`;
 
+              const hasPath = !!file.path;
+              const fileHashState = hashStatuses[file.path] || { status: 'not_started' };
+
               return (
                 <div key={i} className="bg-page-bg border border-border-main rounded-lg p-3 space-y-2">
                   <div className="flex items-start justify-between gap-2">
@@ -237,6 +316,48 @@ export default function TaskDetailsDrawer({
                     </div>
                     <span className="text-[9px] font-mono text-text-dim">{fProgress}%</span>
                   </div>
+                  {hasPath && fProgress === 100 && (
+                    <div className="pt-2 border-t border-border-main/20 flex flex-col gap-1 text-[11px]">
+                      {fileHashState.status === 'not_started' && (
+                        <button
+                          onClick={() => verifyFileHash(file.path)}
+                          className="self-start text-[10px] text-cyan-400 hover:text-cyan-300 font-semibold cursor-pointer py-0.5"
+                        >
+                          🔍 Calculate SHA-256 Hash
+                        </button>
+                      )}
+                      {(fileHashState.status === 'starting' || fileHashState.status === 'processing') && (
+                        <div className="flex items-center justify-between text-text-dim">
+                          <span>Calculating SHA-256...</span>
+                          <span className="font-mono text-cyan-400">{fileHashState.progress || 0}%</span>
+                        </div>
+                      )}
+                      {fileHashState.status === 'completed' && (
+                        <div className="space-y-1">
+                          <span className="text-[10px] text-emerald-400 font-semibold block">✓ SHA-256 Verified:</span>
+                          <div className="flex items-center gap-1.5 bg-slate-950/30 p-1.5 rounded border border-border-main/50">
+                            <span className="font-mono text-[10px] text-text-main break-all select-all flex-1">{fileHashState.hash}</span>
+                            <button
+                              onClick={() => {
+                                navigator.clipboard.writeText(fileHashState.hash || '');
+                                showToast({
+                                  type: 'success',
+                                  title: 'Hash Copied',
+                                  message: 'SHA-256 hash copied to clipboard!'
+                                });
+                              }}
+                              className="text-cyan-400 hover:text-cyan-300 font-semibold text-[9px] px-1 cursor-pointer shrink-0"
+                            >
+                              Copy
+                            </button>
+                          </div>
+                        </div>
+                      )}
+                      {fileHashState.status === 'failed' && (
+                        <span className="text-rose-400 block">✗ Verification failed: {fileHashState.error}</span>
+                      )}
+                    </div>
+                  )}
                 </div>
               );
             })}
