@@ -107,32 +107,23 @@ export function sanitizeMagnetLink(uri: string): string {
     return clean;
   }
   
+  // Normalize to NFC to ensure robust matching on both Windows (NFC) and macOS/iOS (NFD) inputs
+  clean = clean.normalize('NFC');
+  
   // Fix Telex / typing typos in magnet:?xt=urn:btih
-  clean = clean.replace(/xt[ủư]n:btih:/i, 'xt=urn:btih:');
-  clean = clean.replace(/xt=ủn:btih:/i, 'xt=urn:btih:');
-  clean = clean.replace(/xt=ưn:btih:/i, 'xt=urn:btih:');
-  clean = clean.replace(/xtủn:btih/i, 'xt=urn:btih');
-  clean = clean.replace(/xt=ủn:btih/i, 'xt=urn:btih');
-  clean = clean.replace(/xt=ưn:btih/i, 'xt=urn:btih');
+  clean = clean.replace(/xt[ủư]n:btih:?/i, 'xt=urn:btih:');
+  clean = clean.replace(/xt=[ủư]n:btih:?/i, 'xt=urn:btih:');
+  clean = clean.replace(/xt:btih:?/i, 'xt=urn:btih:');
+  clean = clean.replace(/xt=btih:?/i, 'xt=urn:btih:');
   
-  // If 'xt:btih:' occurs (missing =urn)
-  clean = clean.replace(/xt:btih:/i, 'xt=urn:btih:');
-  
-  // Fix missing '=' in trackers (e.g. '&trudp' -> '&tr=udp', '&trhttp' -> '&tr=http')
-  clean = clean.replace(/&trudp%/gi, '&tr=udp%');
-  clean = clean.replace(/&trudp:/gi, '&tr=udp:');
-  clean = clean.replace(/&trhttp%/gi, '&tr=http%');
-  clean = clean.replace(/&trhttp:/gi, '&tr=http:');
-  clean = clean.replace(/&trftp%/gi, '&tr=ftp%');
-  clean = clean.replace(/&trftp:/gi, '&tr=ftp:');
-  clean = clean.replace(/&trws%/gi, '&tr=ws%');
-  clean = clean.replace(/&trws:/gi, '&tr=ws:');
-  clean = clean.replace(/&trwss%/gi, '&tr=wss%');
-  clean = clean.replace(/&trwss:/gi, '&tr=wss:');
+  // Fix missing '=' in query parameters (e.g. '&dnThe' -> '&dn=The', '&trudp' -> '&tr=udp')
+  clean = clean.replace(/&dn([^=])/gi, '&dn=$1');
+  clean = clean.replace(/&tr([^=])/gi, '&tr=$1');
   
   // Fix Vietnamese diacritic typos in common tracker domains (e.g. 'ỏg' -> 'org')
-  clean = clean.replace(/\.ỏg/gi, '.org');
-  clean = clean.replace(/\.đ/gi, '.de');
+  // Collapse any leading dots or hyphens (like '.-ỏg', '-ỏg', '.ỏg') into '.org' / '.de'
+  clean = clean.replace(/[\.\-]+ỏg/gi, '.org');
+  clean = clean.replace(/[\.\-]+đ/gi, '.de');
   clean = clean.replace(/lecherspẩdise/gi, 'leechersparadise');
   
   // Strip trailing junk characters (like trailing =, -, + from copy-paste)
