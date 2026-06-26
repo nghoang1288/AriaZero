@@ -48,7 +48,14 @@ def fetch_history():
         cursor.execute('SELECT * FROM download_history ORDER BY completed_time DESC')
         rows = cursor.fetchall()
         result = []
+        seen_names = set()
         for r in rows:
+            name = r["name"]
+            if name and name != "Unknown":
+                if name in seen_names:
+                    continue
+                seen_names.add(name)
+                
             try:
                 files = json.loads(r["files_json"]) if r["files_json"] else []
             except Exception:
@@ -87,7 +94,13 @@ def delete_history_record(gid):
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
-        cursor.execute('DELETE FROM download_history WHERE gid = ?', (gid,))
+        # Find the name associated with this gid to delete all duplicates together
+        cursor.execute('SELECT name FROM download_history WHERE gid = ?', (gid,))
+        row = cursor.fetchone()
+        if row and row["name"] and row["name"] != "Unknown":
+            cursor.execute('DELETE FROM download_history WHERE name = ?', (row["name"],))
+        else:
+            cursor.execute('DELETE FROM download_history WHERE gid = ?', (gid,))
         conn.commit()
         return cursor.rowcount > 0
     finally:
