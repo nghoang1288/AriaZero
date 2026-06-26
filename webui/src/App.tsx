@@ -38,7 +38,8 @@ import {
   isDoc, 
   isSoftware, 
   isMetadataTask,
-  getFileCategory
+  getFileCategory,
+  sanitizeMagnetLink
 } from './utils/taskUtils';
 
 import ConfirmModal from './components/ConfirmModal';
@@ -100,6 +101,7 @@ function App() {
 
   // Wrap addUri with auto-categorization options
   const addUriWithCategory = useCallback((uri: string, options?: Record<string, string>) => {
+    const sanitizedUri = sanitizeMagnetLink(uri);
     const autoCategorizeEnabled = localStorage.getItem('ariazero_auto_categorize_enabled') !== 'false';
     const baseDir = globalOptionsRef.current.dir || '';
 
@@ -107,11 +109,11 @@ function App() {
     if (autoCategorizeEnabled && baseDir) {
       let filename = '';
       try {
-        const cleanUri = uri.split('?')[0].split('#')[0];
+        const cleanUri = sanitizedUri.split('?')[0].split('#')[0];
         const parts = cleanUri.split('/');
         filename = decodeURIComponent(parts[parts.length - 1] || '');
       } catch (e) {
-        const parts = uri.split('/');
+        const parts = sanitizedUri.split('/');
         filename = decodeURIComponent(parts[parts.length - 1] || '');
       }
 
@@ -129,7 +131,7 @@ function App() {
         }
       }
     }
-    return addUri(uri, mergedOptions);
+    return addUri(sanitizedUri, mergedOptions);
   }, [addUri]);
 
   // Smart download handler: when a link is detected from clipboard/magnet/drag
@@ -776,14 +778,46 @@ function AppContent({
     return [...allActiveAndWaiting, ...stoppedTasks].find(t => t.gid === selectedGid);
   }, [allActiveAndWaiting, stoppedTasks, selectedGid]);
 
-  const handleAddSubmit = (mode: 'link' | 'torrent', uris: string, torrentFile: { name: string; base64: string } | null) => {
+  const handleAddSubmit = async (mode: 'link' | 'torrent', uris: string, torrentFile: { name: string; base64: string } | null) => {
     if (mode === 'link') {
       if (!uris.trim()) return;
       const parsedUris = uris.split('\n').map((u: string) => u.trim()).filter((u: string) => u);
-      parsedUris.forEach((uri: string) => addUri(uri));
+      for (const uri of parsedUris) {
+        try {
+          await addUri(uri);
+          showToast({
+            type: 'success',
+            title: 'Download Started',
+            message: 'Task added to queue successfully.'
+          });
+        } catch (err: any) {
+          console.error('Failed to add URI:', err);
+          const errMsg = err?.message || err || 'Failed to add task to Aria2.';
+          showToast({
+            type: 'error',
+            title: 'Failed to Add Task',
+            message: `Error: ${errMsg}`
+          });
+        }
+      }
     } else {
       if (!torrentFile) return;
-      addTorrent(torrentFile.base64);
+      try {
+        await addTorrent(torrentFile.base64);
+        showToast({
+          type: 'success',
+          title: 'Torrent Started',
+          message: 'Torrent task added to queue successfully.'
+        });
+      } catch (err: any) {
+        console.error('Failed to add torrent:', err);
+        const errMsg = err?.message || err || 'Failed to add torrent to Aria2.';
+        showToast({
+          type: 'error',
+          title: 'Failed to Add Torrent',
+          message: `Error: ${errMsg}`
+        });
+      }
     }
   };
 

@@ -101,3 +101,43 @@ export function getFileCategory(filename: string): 'video' | 'audio' | 'document
   return 'other';
 }
 
+export function sanitizeMagnetLink(uri: string): string {
+  let clean = uri.trim();
+  if (!clean.toLowerCase().startsWith('magnet:')) {
+    return clean;
+  }
+  
+  // Fix Telex / typing typos in magnet:?xt=urn:btih
+  clean = clean.replace(/xt[ủư]n:btih:/i, 'xt=urn:btih:');
+  clean = clean.replace(/xt=ủn:btih:/i, 'xt=urn:btih:');
+  clean = clean.replace(/xt=ưn:btih:/i, 'xt=urn:btih:');
+  clean = clean.replace(/xtủn:btih/i, 'xt=urn:btih');
+  clean = clean.replace(/xt=ủn:btih/i, 'xt=urn:btih');
+  clean = clean.replace(/xt=ưn:btih/i, 'xt=urn:btih');
+  
+  // If 'xt:btih:' occurs (missing =urn)
+  clean = clean.replace(/xt:btih:/i, 'xt=urn:btih:');
+  
+  // Fix missing '=' in trackers (e.g. '&trudp' -> '&tr=udp', '&trhttp' -> '&tr=http')
+  clean = clean.replace(/&trudp%/gi, '&tr=udp%');
+  clean = clean.replace(/&trudp:/gi, '&tr=udp:');
+  clean = clean.replace(/&trhttp%/gi, '&tr=http%');
+  clean = clean.replace(/&trhttp:/gi, '&tr=http:');
+  clean = clean.replace(/&trftp%/gi, '&tr=ftp%');
+  clean = clean.replace(/&trftp:/gi, '&tr=ftp:');
+  clean = clean.replace(/&trws%/gi, '&tr=ws%');
+  clean = clean.replace(/&trws:/gi, '&tr=ws:');
+  clean = clean.replace(/&trwss%/gi, '&tr=wss%');
+  clean = clean.replace(/&trwss:/gi, '&tr=wss:');
+  
+  // Fix Vietnamese diacritic typos in common tracker domains (e.g. 'ỏg' -> 'org')
+  clean = clean.replace(/\.ỏg/gi, '.org');
+  clean = clean.replace(/\.đ/gi, '.de');
+  clean = clean.replace(/lecherspẩdise/gi, 'leechersparadise');
+  
+  // Strip trailing junk characters (like trailing =, -, + from copy-paste)
+  clean = clean.replace(/[=\-+]+$/, '');
+  
+  return clean;
+}
+
