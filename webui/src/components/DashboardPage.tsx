@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useMemo, useState, memo } from 'react';
 import { ArrowDown, CheckCircle, Clock } from 'lucide-react';
 import { formatSpeed } from '../useAria2';
 import type { Aria2Task } from '../useAria2';
@@ -78,7 +78,7 @@ export default function DashboardPage({
   );
 }
 
-function SpeedChart({ speedHistory }: { speedHistory?: { down: number[]; up: number[] } }) {
+const SpeedChart = memo(function SpeedChart({ speedHistory }: { speedHistory?: { down: number[]; up: number[] } }) {
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
   
   const downData = speedHistory?.down || [];
@@ -293,5 +293,5 @@ function SpeedChart({ speedHistory }: { speedHistory?: { down: number[]; up: num
       </div>
     </div>
   );
-}
+});
 

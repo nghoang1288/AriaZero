@@ -1,9 +1,10 @@
-import { useState, useEffect } from 'react';
-import { X, AlertCircle } from 'lucide-react';
+import { useState, useEffect, useRef, useMemo } from 'react';
+import { X, AlertCircle, Folder, FolderOpen, File, ChevronRight, ChevronDown } from 'lucide-react';
 import { formatBytes, formatSpeed } from '../useAria2';
 import type { Aria2Task } from '../useAria2';
 import { getTaskName } from '../utils/taskUtils';
 import { useToast } from '../Toast';
+import { getApiUrl } from '../hooks/useApiUrl';
 
 interface TaskDetailsDrawerProps {
   selectedTask: Aria2Task | null | undefined;
@@ -13,6 +14,178 @@ interface TaskDetailsDrawerProps {
   retryTask: (task: Aria2Task) => void;
   changeTaskOption: (gid: string, options: Record<string, string>) => Promise<any>;
   getTaskOptions: (gid: string) => Promise<any>;
+}
+
+interface TreeNode {
+  name: string;
+  path: string;
+  isFolder: boolean;
+  children: Record<string, TreeNode>;
+  fileIndex?: number;
+  fileData?: any;
+}
+
+const buildFileTree = (files: any[]) => {
+  const root: TreeNode = { name: 'Root', path: '', isFolder: true, children: {} };
+
+  files.forEach((file, index) => {
+    if (!file.path) {
+      const name = file.uris?.[0]?.uri || `File ${index + 1}`;
+      root.children[name] = {
+        name,
+        path: '',
+        isFolder: false,
+        children: {},
+        fileIndex: index,
+        fileData: file
+      };
+      return;
+    }
+
+    const normalizedPath = file.path.replace(/\\/g, '/');
+    const segments = normalizedPath.split('/').filter(Boolean);
+
+    if (segments[0] === 'downloads') {
+      segments.shift();
+    }
+
+    let current = root;
+    for (let i = 0; i < segments.length; i++) {
+      const segment = segments[i];
+      const isLast = i === segments.length - 1;
+
+      if (isLast) {
+        current.children[segment] = {
+          name: segment,
+          path: file.path,
+          isFolder: false,
+          children: {},
+          fileIndex: index,
+          fileData: file
+        };
+      } else {
+        if (!current.children[segment]) {
+          current.children[segment] = {
+            name: segment,
+            path: segments.slice(0, i + 1).join('/'),
+            isFolder: true,
+            children: {}
+          };
+        }
+        current = current.children[segment];
+      }
+    }
+  });
+
+  return root;
+};
+
+interface FileTreeNodeProps {
+  node: TreeNode;
+  verifyFileHash: (filePath: string) => void;
+  hashStatuses: Record<string, { status: string; progress?: number; hash?: string; error?: string }>;
+  showToast: (toast: any) => void;
+}
+
+function FileTreeNode({ node, verifyFileHash, hashStatuses, showToast }: FileTreeNodeProps) {
+  const [isOpen, setIsOpen] = useState(true);
+
+  if (!node.isFolder) {
+    const file = node.fileData;
+    const fLength = Number(file.length);
+    const fCompleted = Number(file.completedLength);
+    const fProgress = fLength > 0 ? Math.min(Math.round((fCompleted / fLength) * 100), 100) : 0;
+    const hasPath = !!file.path;
+    const fileHashState = hashStatuses[file.path] || { status: 'not_started' };
+
+    return (
+      <div className="bg-page-bg/40 border border-border-main/50 rounded-lg p-2.5 space-y-1.5 ml-2">
+        <div className="flex items-start justify-between gap-2">
+          <div className="flex items-center gap-1.5 min-w-0">
+            <File className="w-3.5 h-3.5 text-cyan-400/80 shrink-0" />
+            <span className="text-xs font-medium text-text-main break-all select-all">{node.name}</span>
+          </div>
+          <span className="text-[10px] text-text-dim shrink-0 font-mono">{formatBytes(file.length)}</span>
+        </div>
+        <div className="flex items-center gap-2">
+          <div className="flex-1 bg-page-bg/40 border border-border-main/20 rounded-full h-1 overflow-hidden">
+            <div style={{ width: `${fProgress}%` }} className="h-full rounded-full bg-cyan-500" />
+          </div>
+          <span className="text-[9px] font-mono text-text-dim">{fProgress}%</span>
+        </div>
+        {hasPath && fProgress === 100 && (
+          <div className="pt-1.5 border-t border-border-main/10 flex flex-col gap-1 text-[10px]">
+            {fileHashState.status === 'not_started' && (
+              <button
+                onClick={() => verifyFileHash(file.path)}
+                className="self-start text-[9px] text-cyan-400 hover:text-cyan-300 font-semibold cursor-pointer py-0.5"
+              >
+                🔍 Calculate SHA-256 Hash
+              </button>
+            )}
+            {(fileHashState.status === 'starting' || fileHashState.status === 'processing') && (
+              <div className="flex items-center justify-between text-text-dim">
+                <span>Calculating SHA-256...</span>
+                <span className="font-mono text-cyan-400">{fileHashState.progress || 0}%</span>
+              </div>
+            )}
+            {fileHashState.status === 'completed' && (
+              <div className="space-y-1">
+                <span className="text-[9px] text-emerald-400 font-semibold block">✓ SHA-256 Verified:</span>
+                <div className="flex items-center gap-1.5 bg-slate-950/30 p-1 rounded border border-border-main/50">
+                  <span className="font-mono text-[9px] text-text-main break-all select-all flex-1">{fileHashState.hash}</span>
+                  <button
+                    onClick={() => {
+                      navigator.clipboard.writeText(fileHashState.hash || '');
+                      showToast({
+                        type: 'success',
+                        title: 'Hash Copied',
+                        message: 'SHA-256 hash copied to clipboard!'
+                      });
+                    }}
+                    className="text-cyan-400 hover:text-cyan-300 font-semibold text-[9px] px-1 cursor-pointer shrink-0"
+                  >
+                    Copy
+                  </button>
+                </div>
+              </div>
+            )}
+            {fileHashState.status === 'failed' && (
+              <span className="text-rose-400 block">✗ Verification failed: {fileHashState.error}</span>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  const childKeys = Object.keys(node.children);
+  return (
+    <div className="space-y-1">
+      <button
+        onClick={() => setIsOpen(!isOpen)}
+        className="w-full flex items-center gap-1.5 py-1 px-1.5 rounded hover:bg-page-bg/40 text-text-main/90 hover:text-text-main text-xs transition-colors cursor-pointer select-none"
+      >
+        {isOpen ? <ChevronDown className="w-3.5 h-3.5 text-text-dim" /> : <ChevronRight className="w-3.5 h-3.5 text-text-dim" />}
+        {isOpen ? <FolderOpen className="w-3.5 h-3.5 text-cyan-400" /> : <Folder className="w-3.5 h-3.5 text-cyan-400" />}
+        <span className="font-medium truncate">{node.name}</span>
+      </button>
+
+      {isOpen && (
+        <div className="pl-3.5 border-l border-border-main/40 ml-2 space-y-1.5">
+          {childKeys.map((key) => (
+            <FileTreeNode
+              key={key}
+              node={node.children[key]}
+              verifyFileHash={verifyFileHash}
+              hashStatuses={hashStatuses}
+              showToast={showToast}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
 }
 
 export default function TaskDetailsDrawer({
@@ -75,6 +248,14 @@ export default function TaskDetailsDrawer({
   };
 
   const [hashStatuses, setHashStatuses] = useState<Record<string, { status: string; progress?: number; hash?: string; error?: string }>>({});
+  const hashPollIntervalsRef = useRef<Record<string, ReturnType<typeof setInterval>>>({});
+
+  useEffect(() => {
+    return () => {
+      // Clear all active intervals when the drawer is closed / unmounted
+      Object.values(hashPollIntervalsRef.current).forEach(clearInterval);
+    };
+  }, []);
 
   const verifyFileHash = async (filePath: string) => {
     if (!filePath) return;
@@ -93,15 +274,6 @@ export default function TaskDetailsDrawer({
         headers['Authorization'] = `Bearer ${secret}`;
       }
       
-      const getApiUrl = (path: string): string => {
-        if (location.port === '5173') {
-          return `http://192.168.50.226:16980/api/${path}`;
-        }
-        const protocol = location.protocol === 'https:' ? 'https' : 'http';
-        const port = location.port ? `:${location.port}` : '';
-        return `${protocol}://${location.hostname}${port}/api/${path}`;
-      };
-
       const res = await fetch(getApiUrl('file-hash'), {
         method: 'POST',
         headers,
@@ -133,14 +305,19 @@ export default function TaskDetailsDrawer({
             
             if (statusData.status === 'completed' || statusData.status === 'failed') {
               clearInterval(pollInterval);
+              delete hashPollIntervalsRef.current[filePath];
             }
           } else {
             clearInterval(pollInterval);
+            delete hashPollIntervalsRef.current[filePath];
           }
         } catch (pollErr) {
           clearInterval(pollInterval);
+          delete hashPollIntervalsRef.current[filePath];
         }
       }, 1000);
+
+      hashPollIntervalsRef.current[filePath] = pollInterval;
       
     } catch (err: any) {
       setHashStatuses(prev => ({
@@ -157,35 +334,41 @@ export default function TaskDetailsDrawer({
     return num.toString(2).padStart(4, '0');
   };
 
-  let binString = '';
-  if (selectedTask?.bitfield) {
-    for (let i = 0; i < selectedTask.bitfield.length; i++) {
-      binString += hexCharToBin(selectedTask.bitfield[i]);
-    }
-  }
-
-  const totalPieces = Number(selectedTask?.numPieces || 0) || binString.length;
-  const pieces = binString.slice(0, totalPieces).split('').map(b => b === '1');
-
-  const numSegments = 100;
-  const segments: { completedCount: number; totalCount: number; ratio: number }[] = [];
-  if (totalPieces > 0 && pieces.length > 0) {
-    const chunkSize = pieces.length / numSegments;
-    for (let i = 0; i < numSegments; i++) {
-      const start = Math.floor(i * chunkSize);
-      const end = Math.floor((i + 1) * chunkSize);
-      let completedCount = 0;
-      const totalCount = end - start;
-      for (let j = start; j < end; j++) {
-        if (pieces[j]) completedCount++;
+  const pieces = useMemo(() => {
+    let binString = '';
+    if (selectedTask?.bitfield) {
+      for (let i = 0; i < selectedTask.bitfield.length; i++) {
+        binString += hexCharToBin(selectedTask.bitfield[i]);
       }
-      segments.push({
-        completedCount,
-        totalCount,
-        ratio: totalCount > 0 ? completedCount / totalCount : 0
-      });
     }
-  }
+    const totalPieces = Number(selectedTask?.numPieces || 0) || binString.length;
+    return binString.slice(0, totalPieces).split('').map(b => b === '1');
+  }, [selectedTask?.bitfield, selectedTask?.numPieces]);
+
+  const totalPieces = Number(selectedTask?.numPieces || 0) || pieces.length;
+
+  const segments = useMemo(() => {
+    const numSegments = 100;
+    const list: { completedCount: number; totalCount: number; ratio: number }[] = [];
+    if (totalPieces > 0 && pieces.length > 0) {
+      const chunkSize = pieces.length / numSegments;
+      for (let i = 0; i < numSegments; i++) {
+        const start = Math.floor(i * chunkSize);
+        const end = Math.floor((i + 1) * chunkSize);
+        let completedCount = 0;
+        const totalCount = end - start;
+        for (let j = start; j < end; j++) {
+          if (pieces[j]) completedCount++;
+        }
+        list.push({
+          completedCount,
+          totalCount,
+          ratio: totalCount > 0 ? completedCount / totalCount : 0
+        });
+      }
+    }
+    return list;
+  }, [pieces, totalPieces]);
 
   const getSegmentColor = (ratio: number) => {
     if (ratio === 1) return 'bg-cyan-500 shadow-sm shadow-cyan-500/20';
@@ -294,73 +477,15 @@ export default function TaskDetailsDrawer({
 
         {drawerTab === 'files' && (
           <div className="space-y-3">
-            {selectedTask.files?.map((file: any, i: number) => {
-              const fLength = Number(file.length);
-              const fCompleted = Number(file.completedLength);
-              const fProgress = fLength > 0 ? Math.min(Math.round((fCompleted / fLength) * 100), 100) : 0;
-              const parts = file.path.split(/[/\\]/);
-              const fName = parts[parts.length - 1] || file.uris?.[0]?.uri || `File ${i + 1}`;
-
-              const hasPath = !!file.path;
-              const fileHashState = hashStatuses[file.path] || { status: 'not_started' };
-
-              return (
-                <div key={i} className="bg-page-bg border border-border-main rounded-lg p-3 space-y-2">
-                  <div className="flex items-start justify-between gap-2">
-                    <span className="text-xs font-medium text-text-main break-all select-all">{fName}</span>
-                    <span className="text-[10px] text-text-dim shrink-0 font-mono">{formatBytes(file.length)}</span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <div className="flex-1 bg-page-bg/40 border border-border-main/20 rounded-full h-1.5 overflow-hidden">
-                      <div style={{ width: `${fProgress}%` }} className="h-full rounded-full bg-cyan-500" />
-                    </div>
-                    <span className="text-[9px] font-mono text-text-dim">{fProgress}%</span>
-                  </div>
-                  {hasPath && fProgress === 100 && (
-                    <div className="pt-2 border-t border-border-main/20 flex flex-col gap-1 text-[11px]">
-                      {fileHashState.status === 'not_started' && (
-                        <button
-                          onClick={() => verifyFileHash(file.path)}
-                          className="self-start text-[10px] text-cyan-400 hover:text-cyan-300 font-semibold cursor-pointer py-0.5"
-                        >
-                          🔍 Calculate SHA-256 Hash
-                        </button>
-                      )}
-                      {(fileHashState.status === 'starting' || fileHashState.status === 'processing') && (
-                        <div className="flex items-center justify-between text-text-dim">
-                          <span>Calculating SHA-256...</span>
-                          <span className="font-mono text-cyan-400">{fileHashState.progress || 0}%</span>
-                        </div>
-                      )}
-                      {fileHashState.status === 'completed' && (
-                        <div className="space-y-1">
-                          <span className="text-[10px] text-emerald-400 font-semibold block">✓ SHA-256 Verified:</span>
-                          <div className="flex items-center gap-1.5 bg-slate-950/30 p-1.5 rounded border border-border-main/50">
-                            <span className="font-mono text-[10px] text-text-main break-all select-all flex-1">{fileHashState.hash}</span>
-                            <button
-                              onClick={() => {
-                                navigator.clipboard.writeText(fileHashState.hash || '');
-                                showToast({
-                                  type: 'success',
-                                  title: 'Hash Copied',
-                                  message: 'SHA-256 hash copied to clipboard!'
-                                });
-                              }}
-                              className="text-cyan-400 hover:text-cyan-300 font-semibold text-[9px] px-1 cursor-pointer shrink-0"
-                            >
-                              Copy
-                            </button>
-                          </div>
-                        </div>
-                      )}
-                      {fileHashState.status === 'failed' && (
-                        <span className="text-rose-400 block">✗ Verification failed: {fileHashState.error}</span>
-                      )}
-                    </div>
-                  )}
-                </div>
-              );
-            })}
+            {Object.values(buildFileTree(selectedTask.files || []).children).map((childNode, idx) => (
+              <FileTreeNode
+                key={idx}
+                node={childNode}
+                verifyFileHash={verifyFileHash}
+                hashStatuses={hashStatuses}
+                showToast={showToast}
+              />
+            ))}
           </div>
         )}
 

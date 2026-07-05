@@ -10,7 +10,10 @@ import {
   Folder,
   AlertCircle,
   Clock,
+  Link,
 } from 'lucide-react';
+import { useToast } from './Toast';
+
 
 // ---------------------------------------------------------------------------
 // Types
@@ -723,6 +726,7 @@ function SchedulerSection() {
 
 function SmartDownloadSettingsSection() {
   const [expanded, setExpanded] = useState(true);
+  const { showToast } = useToast();
   const [extensions, setExtensions] = useState(() => {
     return localStorage.getItem('ariazero_custom_extensions') || 
       'zip,rar,7z,tar,gz,bz2,xz,iso,exe,msi,dmg,pkg,deb,rpm,apk,mp4,mkv,avi,mov,mp3,flac,wav,pdf,epub,torrent,gguf,safetensors,bin,ckpt,pth';
@@ -733,6 +737,29 @@ function SmartDownloadSettingsSection() {
     setExtensions(value);
     localStorage.setItem('ariazero_custom_extensions', value);
     window.dispatchEvent(new Event('ariazero_extensions_changed'));
+  };
+
+  const handleRegisterProtocol = () => {
+    try {
+      navigator.registerProtocolHandler(
+        'magnet',
+        window.location.origin + '/?uri=%s'
+      );
+      showToast({
+        type: 'success',
+        title: 'Đăng ký Handler thành công',
+        message: 'Trình duyệt sẽ nhắc bạn xác nhận quyền xử lý liên kết magnet.',
+        duration: 5000
+      });
+    } catch (e) {
+      console.error(e);
+      showToast({
+        type: 'error',
+        title: 'Lỗi đăng ký',
+        message: 'Trình duyệt hoặc cấu hình bảo mật không cho phép đăng ký trực tiếp.',
+        duration: 5000
+      });
+    }
   };
 
   return (
@@ -773,6 +800,23 @@ function SmartDownloadSettingsSection() {
                 placeholder="e.g. zip,rar,mp4,gguf"
                 className="w-full bg-input-bg border border-border-main rounded-lg px-3 py-2 text-xs text-slate-300 focus:outline-none focus:border-cyan-500/70 font-mono"
               />
+            </div>
+          </div>
+
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 px-5 py-3.5 hover:bg-slate-800/10 transition-colors">
+            <div className="sm:max-w-[55%]">
+              <span className="text-xs font-semibold text-slate-200 block">Browser Magnet Association</span>
+              <span className="text-[10px] text-slate-500">Clicking magnet links in this browser will open them directly in AriaZero</span>
+            </div>
+            <div className="w-full sm:w-auto flex justify-end">
+              <button
+                type="button"
+                onClick={handleRegisterProtocol}
+                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-semibold bg-cyan-500 text-white hover:bg-cyan-600 transition-colors shadow-lg shadow-cyan-500/20"
+              >
+                <Link className="w-3.5 h-3.5" />
+                Register Magnet Handler
+              </button>
             </div>
           </div>
         </div>

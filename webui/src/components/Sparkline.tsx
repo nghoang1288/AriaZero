@@ -1,11 +1,11 @@
-
+import { memo } from 'react';
 
 interface SparklineProps {
   data: number[];
   color: string;
 }
 
-export default function Sparkline({ data, color }: SparklineProps) {
+const Sparkline = memo(function Sparkline({ data, color }: SparklineProps) {
   if (!data || data.length < 2) {
     return <div className="w-16 h-5 flex items-center justify-center text-[9px] text-text-dim/40 font-mono">- - -</div>;
   }
@@ -45,4 +45,6 @@ export default function Sparkline({ data, color }: SparklineProps) {
       />
     </svg>
   );
-}
+});
+
+export default Sparkline;

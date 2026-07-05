@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { getTaskName } from './utils/taskUtils';
+import { getApiUrl } from './hooks/useApiUrl';
 
 export { getTaskName };
 
@@ -98,15 +99,6 @@ declare global {
 function getRpcSecret(): string {
   return window.AriaZeroServerConfig?.rpcSecret || '';
 }
-
-const getApiUrl = (path: string): string => {
-  if (location.port === '5173') {
-    return `http://192.168.50.226:16980/api/${path}`;
-  }
-  const protocol = location.protocol === 'https:' ? 'https' : 'http';
-  const port = location.port ? `:${location.port}` : '';
-  return `${protocol}://${location.hostname}${port}/api/${path}`;
-};
 
 export interface Aria2Event {
   id: string;
@@ -305,6 +297,12 @@ export function useAria2() {
     if (socketRef.current) {
       socketRef.current.close();
       socketRef.current = null;
+    }
+    if (pendingRequestsRef.current.size > 0) {
+      pendingRequestsRef.current.forEach((entry) => {
+        entry.reject(new Error('WebSocket disconnected'));
+      });
+      pendingRequestsRef.current.clear();
     }
     if (reconnectTimeoutRef.current) {
       clearTimeout(reconnectTimeoutRef.current);

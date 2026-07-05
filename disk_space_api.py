@@ -294,8 +294,8 @@ def cleanup_orphaned_aria2_files():
                     try:
                         os.remove(file_path)
                         print(f"Cleaned up orphaned control file: {file_path}")
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        print(f"Failed to remove control file {file_path}: {e}")
 
 def background_poller():
     cleanup_counter = 0
@@ -327,9 +327,10 @@ def background_poller():
                 cleanup_counter = 0
                 cleanup_orphaned_aria2_files()
         except Exception as e:
-            pass
+            print(f"Error in background_poller: {e}")
             
         time.sleep(2)
+
 
 
 class DiskSpaceHandler(BaseHTTPRequestHandler):

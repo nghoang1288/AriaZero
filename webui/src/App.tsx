@@ -195,29 +195,43 @@ function App() {
 
   // Bandwidth Scheduler execution
   useEffect(() => {
-    const checkScheduler = () => {
-      const enabled = localStorage.getItem('ariazero_scheduler_enabled') === 'true';
-      if (!enabled) return;
+    let config = {
+      enabled: false,
+      start: '08:00',
+      end: '18:00',
+      dlLimit: '500K',
+      ulLimit: '50K',
+      dlNormal: '0',
+      ulNormal: '0'
+    };
 
-      const start = localStorage.getItem('ariazero_scheduler_start') || '08:00';
-      const end = localStorage.getItem('ariazero_scheduler_end') || '18:00';
-      const dlLimit = localStorage.getItem('ariazero_scheduler_dl_limit') || '500K';
-      const ulLimit = localStorage.getItem('ariazero_scheduler_ul_limit') || '50K';
-      const dlNormal = localStorage.getItem('ariazero_scheduler_dl_normal') || '0';
-      const ulNormal = localStorage.getItem('ariazero_scheduler_ul_normal') || '0';
+    const loadConfig = () => {
+      config = {
+        enabled: localStorage.getItem('ariazero_scheduler_enabled') === 'true',
+        start: localStorage.getItem('ariazero_scheduler_start') || '08:00',
+        end: localStorage.getItem('ariazero_scheduler_end') || '18:00',
+        dlLimit: localStorage.getItem('ariazero_scheduler_dl_limit') || '500K',
+        ulLimit: localStorage.getItem('ariazero_scheduler_ul_limit') || '50K',
+        dlNormal: localStorage.getItem('ariazero_scheduler_dl_normal') || '0',
+        ulNormal: localStorage.getItem('ariazero_scheduler_ul_normal') || '0'
+      };
+    };
+
+    const checkScheduler = () => {
+      if (!config.enabled) return;
 
       const now = new Date();
       const current = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
       
       let isInside = false;
-      if (start <= end) {
-        isInside = current >= start && current < end;
+      if (config.start <= config.end) {
+        isInside = current >= config.start && current < config.end;
       } else {
-        isInside = current >= start || current < end;
+        isInside = current >= config.start || current < config.end;
       }
 
-      const targetDl = isInside ? dlLimit : dlNormal;
-      const targetUl = isInside ? ulLimit : ulNormal;
+      const targetDl = isInside ? config.dlLimit : config.dlNormal;
+      const targetUl = isInside ? config.ulLimit : config.ulNormal;
 
       const currentOptions = globalOptionsRef.current;
       const currentDl = currentOptions['max-overall-download-limit'];
@@ -237,16 +251,24 @@ function App() {
       }
     };
 
-    // Run immediately and every 10s
+    const handleConfigChange = () => {
+      loadConfig();
+      checkScheduler();
+    };
+
+    // Load initially and check
+    loadConfig();
     checkScheduler();
+    
+    // Check every 10s (only time comparison, no localStorage reads!)
     const timer = setInterval(checkScheduler, 10000);
 
     // Listen for scheduler change events from the SettingsPanel
-    window.addEventListener('ariazero_scheduler_changed', checkScheduler);
+    window.addEventListener('ariazero_scheduler_changed', handleConfigChange);
 
     return () => {
       clearInterval(timer);
-      window.removeEventListener('ariazero_scheduler_changed', checkScheduler);
+      window.removeEventListener('ariazero_scheduler_changed', handleConfigChange);
     };
   }, [updateGlobalOptions, showToast]);
 
@@ -427,6 +449,10 @@ function AppContent({
   const { isDragging } = useSmartDownload();
   const [showMobileSidebar, setShowMobileSidebar] = useState(false);
   const [showSambaPass, setShowSambaPass] = useState(false);
+
+  const activeCount = useMemo(() => {
+    return allActiveAndWaiting.filter((t: Aria2Task) => t.status === 'active' && !isTorrentCompleted(t) && !isMetadataTask(t)).length;
+  }, [allActiveAndWaiting]);
 
   const { showToast } = useToast();
   const { getApiUrl } = useApiUrl();
@@ -748,31 +774,55 @@ function AppContent({
     return [...allActiveAndWaiting, ...stoppedTasks].filter((t: Aria2Task) => !isMetadataTask(t));
   }, [allActiveAndWaiting, stoppedTasks]);
 
-  const activeCount = useMemo(() => {
-    return allActiveAndWaiting.filter((t: Aria2Task) => t.status === 'active' && !isTorrentCompleted(t) && !isMetadataTask(t)).length;
-  }, [allActiveAndWaiting]);
+  const categoryCounts = useMemo(() => {
+    let active = 0;
+    let completed = 0;
+    let torrent = 0;
+    let video = 0;
+    let audio = 0;
+    let doc = 0;
+    let software = 0;
 
-  const completedCount = useMemo(() => {
-    return stoppedTasks.filter((t: Aria2Task) => t.status === 'complete' && !isMetadataTask(t)).length + 
-           allActiveAndWaiting.filter((t: Aria2Task) => isTorrentCompleted(t) && !isMetadataTask(t)).length;
-  }, [stoppedTasks, allActiveAndWaiting]);
+    allActiveAndWaiting.forEach((t: Aria2Task) => {
+      if (isMetadataTask(t)) return;
+      if (t.status === 'active' && !isTorrentCompleted(t)) {
+        active++;
+      }
+      if (isTorrentCompleted(t)) {
+        completed++;
+      }
+    });
 
-  const torrentCount = useMemo(() => allTasks.filter(isTorrent).length, [allTasks]);
-  const videoCount = useMemo(() => allTasks.filter(t => isVideo(getFileExtension(getTaskName(t)))).length, [allTasks]);
-  const audioCount = useMemo(() => allTasks.filter(t => isAudio(getFileExtension(getTaskName(t)))).length, [allTasks]);
-  const docCount = useMemo(() => allTasks.filter(t => isDoc(getFileExtension(getTaskName(t)))).length, [allTasks]);
-  const softwareCount = useMemo(() => allTasks.filter(t => isSoftware(getFileExtension(getTaskName(t)))).length, [allTasks]);
+    stoppedTasks.forEach((t: Aria2Task) => {
+      if (isMetadataTask(t)) return;
+      if (t.status === 'complete') {
+        completed++;
+      }
+    });
+
+    allTasks.forEach((t: Aria2Task) => {
+      if (isTorrent(t)) torrent++;
+      const ext = getFileExtension(getTaskName(t));
+      if (isVideo(ext)) video++;
+      else if (isAudio(ext)) audio++;
+      else if (isDoc(ext)) doc++;
+      else if (isSoftware(ext)) software++;
+    });
+
+    return { active, completed, torrent, video, audio, doc, software };
+  }, [allActiveAndWaiting, stoppedTasks, allTasks]);
 
   const categories = useMemo(() => [
     { id: 'all', label: 'All Tasks', icon: Folder, count: allTasks.length },
-    { id: 'active', label: 'Active', icon: Activity, count: activeCount },
-    { id: 'completed', label: 'Completed', icon: CheckCircle, count: completedCount },
-    { id: 'torrents', label: 'Torrents', icon: Share2, count: torrentCount },
-    { id: 'video', label: 'Video', icon: Film, count: videoCount },
-    { id: 'audio', label: 'Audio', icon: Music, count: audioCount },
-    { id: 'documents', label: 'Documents', icon: FileText, count: docCount },
-    { id: 'software', label: 'Software / Zip', icon: Box, count: softwareCount },
-  ], [allTasks.length, activeCount, completedCount, torrentCount, videoCount, audioCount, docCount, softwareCount]);
+    { id: 'active', label: 'Active', icon: Activity, count: categoryCounts.active },
+    { id: 'completed', label: 'Completed', icon: CheckCircle, count: categoryCounts.completed },
+    { id: 'torrents', label: 'Torrents', icon: Share2, count: categoryCounts.torrent },
+    { id: 'video', label: 'Video', icon: Film, count: categoryCounts.video },
+    { id: 'audio', label: 'Audio', icon: Music, count: categoryCounts.audio },
+    { id: 'documents', label: 'Documents', icon: FileText, count: categoryCounts.doc },
+    { id: 'software', label: 'Software / Zip', icon: Box, count: categoryCounts.software },
+  ], [allTasks.length, categoryCounts]);
+
 
   const selectedTask = useMemo(() => {
     return [...allActiveAndWaiting, ...stoppedTasks].find(t => t.gid === selectedGid);
@@ -1112,7 +1162,12 @@ function AppContent({
         {/* Global speed indicator at bottom */}
         <footer className="h-12 bg-sidebar-bg border-t border-border-main flex items-center justify-between px-4 md:px-8 text-xs text-text-dim shrink-0 flex-shrink-0">
           <div className="flex items-center gap-3">
-            <span>AriaZero</span>
+            <span className="flex items-center gap-1.5 font-semibold text-text-main">
+              AriaZero
+              <span className="text-[10px] bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 px-1.5 py-0.5 rounded font-mono font-bold">
+                v1.1.0
+              </span>
+            </span>
             <span className="hidden lg:inline text-[10px] text-text-dim/60 font-mono">Real-time Graphs • Task details drawer • Bandwidth scheduler</span>
           </div>
           

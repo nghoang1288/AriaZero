@@ -1,4 +1,4 @@
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import { ArrowUp, Pause, Play, Trash2, AlertCircle, Check } from 'lucide-react';
 import { formatBytes, formatSpeed } from '../useAria2';
 import type { Aria2Task } from '../useAria2';
@@ -10,6 +10,8 @@ import {
   filterTaskByCategory 
 } from '../utils/taskUtils';
 import TaskCard from './TaskCard';
+import ContextMenu from './ContextMenu';
+import { useToast } from '../Toast';
 
 interface DownloadsPageProps {
   activeTasks: Aria2Task[];
@@ -46,6 +48,17 @@ export default function DownloadsPage({
   setShowClearAllConfirm,
   setDeleteClearAllFiles,
 }: DownloadsPageProps) {
+  const { showToast } = useToast();
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; task: Aria2Task } | null>(null);
+
+  const handleContextMenu = (e: React.MouseEvent, task: Aria2Task) => {
+    e.preventDefault();
+    setContextMenu({
+      x: e.clientX,
+      y: e.clientY,
+      task
+    });
+  };
 
   const lowercaseQuery = useMemo(() => searchQuery.toLowerCase().trim(), [searchQuery]);
 
@@ -135,6 +148,7 @@ export default function DownloadsPage({
                 onRemove={handleInitiateRemove}
                 onSelect={setSelectedGid}
                 isSelected={selectedGid === task.gid}
+                onContextMenu={handleContextMenu}
               />
             ))}
           </div>
@@ -184,6 +198,7 @@ export default function DownloadsPage({
                           if ((e.target as HTMLElement).closest('button')) return;
                           setSelectedGid(task.gid);
                         }}
+                        onContextMenu={(e) => handleContextMenu(e, task)}
                         className={`border-b border-border-main hover:bg-page-bg/25 text-xs text-text-main cursor-pointer transition-colors ${
                           selectedGid === task.gid ? 'bg-cyan-500/5' : ''
                         }`}
@@ -268,6 +283,20 @@ export default function DownloadsPage({
           </div>
         )}
       </div>
+
+      {contextMenu && (
+        <ContextMenu
+          x={contextMenu.x}
+          y={contextMenu.y}
+          task={contextMenu.task}
+          onClose={() => setContextMenu(null)}
+          onPause={pauseTask}
+          onResume={resumeTask}
+          onRemove={handleInitiateRemove}
+          onSelect={setSelectedGid}
+          showToast={showToast}
+        />
+      )}
     </div>
   );
 }

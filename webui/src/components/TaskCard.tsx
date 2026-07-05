@@ -1,3 +1,4 @@
+import { memo } from 'react';
 import { Pause, Play, Trash2 } from 'lucide-react';
 import { formatSpeed, formatETA, formatBytes } from '../useAria2';
 import type { Aria2Task } from '../useAria2';
@@ -10,9 +11,18 @@ interface TaskCardProps {
   onRemove: (task: Aria2Task) => void;
   onSelect: (gid: string) => void;
   isSelected: boolean;
+  onContextMenu?: (e: React.MouseEvent, task: Aria2Task) => void;
 }
 
-export default function TaskCard({ task, onPause, onResume, onRemove, onSelect, isSelected }: TaskCardProps) {
+const TaskCard = memo(function TaskCard({
+  task,
+  onPause,
+  onResume,
+  onRemove,
+  onSelect,
+  isSelected,
+  onContextMenu
+}: TaskCardProps) {
   const isActive = task.status === 'active';
   const isPaused = task.status === 'paused' || task.status === 'waiting';
   const total = Number(task.totalLength);
@@ -27,6 +37,12 @@ export default function TaskCard({ task, onPause, onResume, onRemove, onSelect, 
       onClick={(e) => {
         if ((e.target as HTMLElement).closest('button')) return;
         onSelect(task.gid);
+      }}
+      onContextMenu={(e) => {
+        if (onContextMenu) {
+          e.preventDefault();
+          onContextMenu(e, task);
+        }
       }}
       className={`border rounded-xl p-4 flex flex-col md:flex-row md:items-center justify-between gap-4 transition-all cursor-pointer ${
         isSelected 
@@ -111,4 +127,6 @@ export default function TaskCard({ task, onPause, onResume, onRemove, onSelect, 
       </div>
     </div>
   );
-}
+});
+
+export default TaskCard;
