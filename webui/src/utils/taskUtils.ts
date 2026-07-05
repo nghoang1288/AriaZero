@@ -60,6 +60,10 @@ export const isTorrentCompleted = (task: Aria2Task) => {
 
 // Identify completed metadata tasks to hide them
 export const isMetadataTask = (task: Aria2Task) => {
+  // Do not hide active or waiting metadata downloads
+  if (task.status === 'active' || task.status === 'waiting') {
+    return false;
+  }
   const name = getTaskName(task).toLowerCase();
   const hasBt = !!task.bittorrent && Object.keys(task.bittorrent).length > 0;
   return name.includes('[metadata]') || 
