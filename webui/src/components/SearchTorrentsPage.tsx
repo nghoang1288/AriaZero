@@ -94,9 +94,9 @@ export default function SearchTorrentsPage({ addUri, showToast }: SearchTorrents
       fetchTrendingCategory('tv'),
       fetchTrendingCategory('games')
     ]);
-    setTrendingMovies(movies.slice(0, 10));
-    setTrendingTV(tv.slice(0, 10));
-    setTrendingGames(games.slice(0, 10));
+    setTrendingMovies(movies.slice(0, 30));
+    setTrendingTV(tv.slice(0, 30));
+    setTrendingGames(games.slice(0, 30));
     setIsLoadingTrending(false);
   }, [fetchTrendingCategory]);
 
@@ -398,7 +398,7 @@ export default function SearchTorrentsPage({ addUri, showToast }: SearchTorrents
               Trending & Top Seeded Torrents
             </h2>
             <span className="bg-amber-500/10 text-amber-400 text-[10px] font-bold px-2 py-0.5 rounded border border-amber-500/10 font-mono">
-              Top 10
+              Top 30
             </span>
           </div>
 
@@ -455,7 +455,7 @@ function TrendingSection({ title, icon, items, onDownload }: TrendingSectionProp
         {title}
       </div>
 
-      <div className="flex-1 divide-y divide-border-main/40 overflow-y-auto max-h-[480px]">
+      <div className="flex-1 divide-y divide-border-main/40 overflow-y-auto max-h-[850px]">
         {items.length > 0 ? (
           items.map((item, idx) => (
             <div key={idx} className="p-4 hover:bg-page-bg/10 transition-colors flex items-start justify-between gap-3">

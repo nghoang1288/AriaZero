@@ -55,6 +55,14 @@ else
     sed -i 's/^check-integrity=.*/check-integrity=true/' "$CONF_FILE"
 fi
 
+# Ensure auto-file-renaming=false is set to overwrite duplicates instead of renaming them
+if ! grep -q "^auto-file-renaming=" "$CONF_FILE"; then
+    echo "auto-file-renaming=false" >> "$CONF_FILE"
+else
+    sed -i 's/^auto-file-renaming=.*/auto-file-renaming=false/' "$CONF_FILE"
+fi
+
+
 
 
 # Ensure permissions on configuration and downloads folders
@@ -194,10 +202,19 @@ else:
     print("Jackett failed to start within the timeout period. Exiting setup script.")
     exit(1)
 
-indexers = ["1337x", "thepiratebay", "yts", "eztv", "limetorrents"]
+# Remove 1337x.json configuration file to prevent search timeouts
+config_1337x = "/config/jackett/Indexers/1337x.json"
+if os.path.exists(config_1337x):
+    try:
+        os.remove(config_1337x)
+        print("Successfully removed 1337x.json configuration file.")
+    except Exception as e:
+        print("Failed to remove 1337x.json:", e)
+
+indexers = ["thepiratebay", "yts", "eztv", "limetorrents"]
 for idx in indexers:
     config_file = f"/config/jackett/Indexers/{idx}.json"
-    
+
     # Check if already configured (size > 100 bytes)
     if os.path.exists(config_file) and os.path.getsize(config_file) > 100:
         print(f"Indexer {idx} is already configured. Skipping.")
@@ -209,6 +226,13 @@ for idx in indexers:
         req_get = urllib.request.Request(url_get, headers={"Accept": "application/json"})
         with opener.open(req_get, timeout=5) as resp:
             default_config = json.loads(resp.read().decode('utf-8'))
+            
+        # Customize 1337x to use a working mirror domain (1337x.ws) that is not blocked by Cloudflare
+        if idx == "1337x":
+            for field in default_config:
+                if field.get("id") == "sitelink":
+                    field["value"] = "https://1337x.ws/"
+                    print("Customized 1337x Site Link to https://1337x.ws/")
             
         url_post = f"http://127.0.0.1/jackett/api/v2.0/indexers/{idx}/config"
         req_post = urllib.request.Request(

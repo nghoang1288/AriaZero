@@ -1,5 +1,6 @@
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import re
 import shutil
 import os
 import sqlite3
@@ -8,7 +9,7 @@ import time
 import urllib.request
 import urllib.error
 import hashlib
-from urllib.parse import urlparse, parse_qs, urlencode
+from urllib.parse import urlparse, parse_qs, urlencode, quote
 import xml.etree.ElementTree as ET
 
 DB_PATH = '/config/ariazero_history.db'
@@ -354,7 +355,7 @@ def get_jackett_api_key():
     except Exception:
         return ""
 
-def search_jackett(query, categories=None):
+def search_jackett(query, categories=None, t="search"):
     """Search torrents via Jackett's Torznab API and return parsed results."""
     api_key = get_jackett_api_key()
     if not api_key:
@@ -362,8 +363,8 @@ def search_jackett(query, categories=None):
 
     params = {
         "apikey": api_key,
-        "Query": query,
-        "t": "search"
+        "q": query,
+        "t": t
     }
     if categories:
         params["cat"] = categories
@@ -380,6 +381,99 @@ def search_jackett(query, categories=None):
     except Exception as e:
         return {"error": f"Search failed: {str(e)}", "results": []}
 
+def fetch_apibay_top100(category_id):
+    """Directly fetch Top 100 torrents from apibay.org for a specific category."""
+    url = f"https://apibay.org/precompiled/data_top100_{category_id}.json"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+        
+        results = []
+        for item in data:
+            name = item.get("name", "")
+            if not name or name == "No torrents found":
+                continue
+            
+            info_hash = item.get("info_hash", "")
+            if not info_hash or info_hash == "0000000000000000000000000000000000000000":
+                continue
+                
+            magnet = f"magnet:?xt=urn:btih:{info_hash}&dn={quote(name)}"
+            # Add some standard public trackers
+            trackers = [
+                "udp://tracker.opentrackr.org:1337/announce",
+                "udp://open.demonii.com:1337/announce",
+                "udp://open.stealth.si:80/announce",
+                "udp://tracker.torrent.eu.org:451/announce"
+            ]
+            for tr in trackers:
+                magnet += f"&tr={quote(tr)}"
+                
+            try:
+                size = int(item.get("size", 0))
+                seeders = int(item.get("seeders", 0))
+                leechers = int(item.get("leechers", 0))
+            except:
+                size = 0
+                seeders = 0
+                leechers = 0
+                
+            pub_date = ""
+            try:
+                added = int(item.get("added", 0))
+                if added:
+                    pub_date = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(added))
+            except:
+                pass
+                
+            results.append({
+                "title": name,
+                "size": size,
+                "seeders": seeders,
+                "leechers": leechers,
+                "magnetUri": magnet,
+                "infoUrl": f"https://thepiratebay.org/description.php?id={item.get('id')}",
+                "tracker": "The Pirate Bay",
+                "publishDate": pub_date,
+                "category": item.get("category", "")
+            })
+        return results
+    except Exception as e:
+        print(f"Failed to fetch apibay top 100 for category {category_id}: {e}")
+        return []
+
+def get_movie_dedup_key(title):
+    """Generate a deduplication key for movies based on title and year."""
+    match = re.search(r'[\s\.\(\[-](19\d{2}|20\d{2})[\s\.\)\]-]', title)
+    if match:
+        year = match.group(1)
+        idx = match.start()
+        title_prefix = title[:idx]
+        clean_title = re.sub(r'[^a-zA-Z0-9]', '', title_prefix).lower()
+        if clean_title:
+            return f"{clean_title}_{year}"
+            
+    # Fallback: strip common resolution and codec tags
+    clean_title = re.sub(r'(1080p|720p|2160p|4k|hdrip|webrip|brrip|bluray|x264|x265|hevc|dd5|dts|h264|h265|aac).*', '', title, flags=re.IGNORECASE)
+    clean_title = re.sub(r'[^a-zA-Z0-9]', '', clean_title).lower()
+    return clean_title
+
+def get_tv_dedup_key(title):
+    """Generate a deduplication key for TV shows based on title and season."""
+    match = re.search(r'(?i)[\s\.\(\[-](s\d{1,2}|season\s?\d{1,2})', title)
+    if match:
+        season = match.group(1).lower()
+        idx = match.start()
+        title_prefix = title[:idx]
+        clean_title = re.sub(r'[^a-zA-Z0-9]', '', title_prefix).lower()
+        if clean_title:
+            return f"{clean_title}_{season}"
+    return get_movie_dedup_key(title)
+
 def get_trending(category="all"):
     """Get trending/top torrents. Uses cache to avoid hammering Jackett."""
     cache_key = category
@@ -388,6 +482,22 @@ def get_trending(category="all"):
     if cache_key in _trending_cache and (now - _trending_cache_time.get(cache_key, 0)) < TRENDING_CACHE_TTL:
         return _trending_cache[cache_key]
 
+    results = []
+
+    # 1. Fetch from apibay.org (The Pirate Bay) directly for precise Top 100 lists
+    apibay_results = []
+    if category == "movies":
+        apibay_results += fetch_apibay_top100("201")
+        apibay_results += fetch_apibay_top100("200")
+    elif category == "tv":
+        apibay_results += fetch_apibay_top100("208")
+        apibay_results += fetch_apibay_top100("205")
+    elif category == "games":
+        apibay_results += fetch_apibay_top100("400")
+        
+    results += apibay_results
+
+    # 2. Fetch from Jackett (YTS, LimeTorrents, eztv)
     cat_map = {
         "movies": "2000",
         "tv": "5000",
@@ -398,13 +508,52 @@ def get_trending(category="all"):
     }
     cat_id = cat_map.get(category, "")
 
-    result = search_jackett("", categories=cat_id if cat_id else None)
+    t_type = "movie" if category == "movies" else ("tvsearch" if category == "tv" else "search")
+    cat_to_pass = None if category in ("movies", "tv") else (cat_id if cat_id else None)
 
-    if "error" not in result or result.get("results"):
-        result["results"] = sorted(result.get("results", []), key=lambda x: x.get("seeders", 0), reverse=True)
-        result["results"] = result["results"][:50]
-        _trending_cache[cache_key] = result
-        _trending_cache_time[cache_key] = now
+    jackett_res = search_jackett("", categories=cat_to_pass, t=t_type)
+    if "results" in jackett_res:
+        results += jackett_res["results"]
+
+    # 3. Sort by seeders descending FIRST so we always keep the highest seeded release
+    results.sort(key=lambda x: x.get("seeders", 0), reverse=True)
+
+    # 4. Filter duplicates (by magnet, title, resolution key) and non-English releases
+    seen_magnets = set()
+    seen_titles = set()
+    seen_dedup_keys = set()
+    filtered_results = []
+    
+    # Exclude CJK (Chinese/Japanese/Korean) and Cyrillic (Russian) characters to ensure English-only titles
+    english_only_pattern = re.compile(r'[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7a3\u0400-\u04ff]')
+
+    for item in results:
+        title = item.get("title", "")
+        # Filter non-English titles
+        if english_only_pattern.search(title):
+            continue
+            
+        magnet = item.get("magnetUri", "")
+        title_lower = title.lower().strip()
+        
+        # Determine deduplication key
+        if category == "tv":
+            dedup_key = get_tv_dedup_key(title)
+        else:
+            dedup_key = get_movie_dedup_key(title)
+            
+        # Avoid duplicate matches
+        if magnet in seen_magnets or title_lower in seen_titles or dedup_key in seen_dedup_keys:
+            continue
+            
+        seen_magnets.add(magnet)
+        seen_titles.add(title_lower)
+        seen_dedup_keys.add(dedup_key)
+        filtered_results.append(item)
+
+    result = {"results": filtered_results[:50]}
+    _trending_cache[cache_key] = result
+    _trending_cache_time[cache_key] = now
 
     return result
 
