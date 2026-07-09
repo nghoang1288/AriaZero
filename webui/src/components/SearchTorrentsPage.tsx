@@ -57,6 +57,10 @@ export default function SearchTorrentsPage({ addUri, showToast }: SearchTorrents
     if (secret) {
       headers['Authorization'] = `Bearer ${secret}`;
     }
+    const userOmdbKey = localStorage.getItem('ariazero_omdb_api_key');
+    if (userOmdbKey) {
+      headers['X-OMDb-API-Key'] = userOmdbKey;
+    }
     return headers;
   }, []);
 
@@ -114,6 +118,17 @@ export default function SearchTorrentsPage({ addUri, showToast }: SearchTorrents
     };
     init();
   }, [checkJackettStatus, loadTrendingData]);
+
+  // Refresh trending data when Settings change (e.g. OMDb API Key updated)
+  useEffect(() => {
+    const handleSettingsChanged = () => {
+      loadTrendingData();
+    };
+    window.addEventListener('ariazero_settings_changed', handleSettingsChanged);
+    return () => {
+      window.removeEventListener('ariazero_settings_changed', handleSettingsChanged);
+    };
+  }, [loadTrendingData]);
 
   // Perform search
   const handleSearch = async (e?: React.FormEvent) => {
@@ -510,10 +525,10 @@ function TrendingSection({ title, icon, items, onDownload }: TrendingSectionProp
                   </span>
                   {/* Plot tooltip on hover */}
                   {item.plot && (
-                    <div className="absolute left-0 bottom-full mb-2 w-72 p-3 bg-[#0c1520] border border-border-main rounded-xl shadow-2xl shadow-black/40 text-[11px] leading-relaxed text-text-dim z-50 opacity-0 pointer-events-none group-hover:opacity-100 transition-opacity duration-200 backdrop-blur-sm">
+                    <div className="absolute left-0 top-full mt-2 w-72 p-3 bg-[#0c1520] border border-border-main rounded-xl shadow-2xl shadow-black/40 text-[11px] leading-relaxed text-text-dim z-50 opacity-0 pointer-events-none group-hover:opacity-100 transition-opacity duration-200 backdrop-blur-sm">
                       <div className="text-[10px] font-bold text-cyan-400 mb-1 uppercase tracking-wider">Synopsis</div>
                       {item.plot}
-                      <div className="absolute left-4 -bottom-1.5 w-3 h-3 bg-[#0c1520] border-r border-b border-border-main rotate-45"></div>
+                      <div className="absolute left-4 -top-1.5 w-3 h-3 bg-[#0c1520] border-l border-t border-border-main rotate-45"></div>
                     </div>
                   )}
                 </div>

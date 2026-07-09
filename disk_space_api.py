@@ -535,12 +535,13 @@ def _get_omdb_cache_key(title, year=None, media_type='movie'):
         key += f":{year}"
     return key
 
-def fetch_omdb_metadata(title, year=None, media_type='movie'):
+def fetch_omdb_metadata(title, year=None, media_type='movie', omdb_key=None):
     """Query OMDb API for movie/TV metadata. Returns cached result if available.
     
     Returns dict with keys: genre, rtScore, plot, poster (or empty dict on failure).
     """
-    if not OMDB_API_KEY:
+    key_to_use = omdb_key or OMDB_API_KEY
+    if not key_to_use:
         return {}
     
     cache_key = _get_omdb_cache_key(title, year, media_type)
@@ -568,7 +569,7 @@ def fetch_omdb_metadata(title, year=None, media_type='movie'):
     
     # Query OMDb API
     try:
-        params = {'apikey': OMDB_API_KEY, 't': title, 'type': media_type, 'plot': 'short'}
+        params = {'apikey': key_to_use, 't': title, 'type': media_type, 'plot': 'short'}
         if year:
             params['y'] = year
         
@@ -633,24 +634,31 @@ def _store_omdb_cache(cache_key, genre, rt_score, plot, poster):
     except Exception as e:
         print(f"OMDb cache write error: {e}")
 
-def enrich_trending_with_metadata(results, category):
+def enrich_trending_with_metadata(results, category, omdb_key=None):
     """Enrich trending torrent results with movie metadata from OMDb.
     
     Only enriches movies and TV shows (not games).
     Uses ThreadPoolExecutor for parallel lookups.
     """
-    if category not in ('movies', 'tv') or not OMDB_API_KEY:
+    key_to_use = omdb_key or OMDB_API_KEY
+    if category not in ('movies', 'tv') or not key_to_use:
         return results
     
     media_type = 'movie' if category == 'movies' else 'series'
     
     def enrich_single(item):
         title = item.get('title', '')
-        clean_title, year = extract_clean_title(title, category)
+        
+        # Auto-detect TV episodes even in movies category (SxxExx pattern)
+        is_tv_episode = bool(re.search(r'(?i)s\d{1,2}e\d{1,2}', title))
+        actual_media_type = 'series' if is_tv_episode else media_type
+        actual_category = 'tv' if is_tv_episode else category
+        
+        clean_title, year = extract_clean_title(title, actual_category)
         if not clean_title:
             return item
         
-        metadata = fetch_omdb_metadata(clean_title, year, media_type)
+        metadata = fetch_omdb_metadata(clean_title, year, actual_media_type, key_to_use)
         if metadata:
             enriched = dict(item)
             enriched.update(metadata)
@@ -670,7 +678,7 @@ def enrich_trending_with_metadata(results, category):
     
     return enriched_results
 
-def get_trending(category="all"):
+def get_trending(category="all", omdb_key=None):
     """Get trending/top torrents. Uses cache to avoid hammering Jackett."""
     cache_key = category
     now = time.time()
@@ -748,7 +756,7 @@ def get_trending(category="all"):
         filtered_results.append(item)
     # Enrich with OMDb metadata (genre, RT score, plot, poster) for movies/TV
     top_results = filtered_results[:50]
-    top_results = enrich_trending_with_metadata(top_results, category)
+    top_results = enrich_trending_with_metadata(top_results, category, omdb_key)
 
     result = {"results": top_results}
     _trending_cache[cache_key] = result
@@ -992,7 +1000,8 @@ class DiskSpaceHandler(BaseHTTPRequestHandler):
             try:
                 query_params = parse_qs(urlparse(self.path).query)
                 cat = query_params.get('cat', ['all'])[0]
-                result = get_trending(cat)
+                omdb_key = self.headers.get('X-OMDb-API-Key') or self.headers.get('x-omdb-api-key') or OMDB_API_KEY
+                result = get_trending(cat, omdb_key)
 
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json')

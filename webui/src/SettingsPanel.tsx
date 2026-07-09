@@ -864,6 +864,11 @@ function AriaZeroFeaturesSection() {
     return val === null ? true : val === 'true';
   });
 
+  // Movie Metadata State
+  const [omdbApiKey, setOmdbApiKey] = useState(() => {
+    return localStorage.getItem('ariazero_omdb_api_key') || '';
+  });
+
   const update = (key: string, value: string) => {
     localStorage.setItem(key, value);
     window.dispatchEvent(new Event('ariazero_settings_changed'));
@@ -1065,6 +1070,30 @@ function AriaZeroFeaturesSection() {
                   setSoundEnabled(val);
                   update('ariazero_sound_enabled', String(val));
                 }}
+              />
+            </div>
+          </div>
+
+          {/* Section Subtitle: Movie Metadata */}
+          <div className="px-5 py-2.5 bg-slate-800/20 border-t border-border-main">
+            <span className="text-xs font-semibold text-cyan-400 uppercase tracking-wider">Movie Metadata (OMDb API)</span>
+          </div>
+
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 px-5 py-3.5 hover:bg-slate-800/10 transition-colors">
+            <div className="sm:max-w-[55%]">
+              <span className="text-xs font-semibold text-slate-200 block">OMDb API Key</span>
+              <span className="text-[10px] text-slate-500">Provide an API key from omdbapi.com to load movie genres, RT score, plot synopsis and poster</span>
+            </div>
+            <div className="w-full sm:w-56">
+              <input
+                type="text"
+                placeholder="e.g. 2b2ca076"
+                value={omdbApiKey}
+                onChange={(e) => {
+                  setOmdbApiKey(e.target.value);
+                  update('ariazero_omdb_api_key', e.target.value);
+                }}
+                className="w-full bg-input-bg border border-border-main rounded-lg px-3 py-2 text-xs text-slate-300 focus:outline-none focus:border-cyan-500/70"
               />
             </div>
           </div>
