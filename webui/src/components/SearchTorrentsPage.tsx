@@ -19,6 +19,11 @@ interface TorrentResult {
   tracker: string;
   publishDate: string;
   category: string;
+  // OMDb metadata (optional, only for movies/TV)
+  genre?: string;
+  rtScore?: string;
+  plot?: string;
+  poster?: string;
 }
 
 interface JackettStatus {
@@ -447,6 +452,22 @@ interface TrendingSectionProps {
   onDownload: (magnetUri: string, title: string) => void;
 }
 
+function getRtScoreColor(score: string): string {
+  const num = parseInt(score);
+  if (isNaN(num)) return 'text-text-dim';
+  if (num >= 75) return 'text-emerald-400';
+  if (num >= 60) return 'text-amber-400';
+  return 'text-red-400';
+}
+
+function getRtBgColor(score: string): string {
+  const num = parseInt(score);
+  if (isNaN(num)) return 'bg-white/5';
+  if (num >= 75) return 'bg-emerald-500/10 border-emerald-500/20';
+  if (num >= 60) return 'bg-amber-500/10 border-amber-500/20';
+  return 'bg-red-500/10 border-red-500/20';
+}
+
 function TrendingSection({ title, icon, items, onDownload }: TrendingSectionProps) {
   return (
     <div className="flex flex-col border border-border-main rounded-xl bg-sidebar-bg/15 overflow-hidden">
@@ -458,35 +479,80 @@ function TrendingSection({ title, icon, items, onDownload }: TrendingSectionProp
       <div className="flex-1 divide-y divide-border-main/40 overflow-y-auto max-h-[850px]">
         {items.length > 0 ? (
           items.map((item, idx) => (
-            <div key={idx} className="p-4 hover:bg-page-bg/10 transition-colors flex items-start justify-between gap-3">
-              <div className="space-y-1.5 flex-1 min-w-0">
-                <span className="block text-xs font-semibold text-text-main hover:text-cyan-400 truncate leading-relaxed">
-                  {item.infoUrl ? (
-                    <a href={item.infoUrl} target="_blank" rel="noopener noreferrer">
-                      {item.title}
-                    </a>
-                  ) : (
-                    item.title
+            <div key={idx} className="group relative p-3.5 hover:bg-page-bg/10 transition-colors flex items-start gap-3">
+              {/* Poster Thumbnail */}
+              {item.poster ? (
+                <img
+                  src={item.poster}
+                  alt=""
+                  className="w-10 h-14 rounded-md object-cover shrink-0 border border-border-main/30 shadow-sm bg-page-bg/30"
+                  loading="lazy"
+                  onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }}
+                />
+              ) : (
+                <div className="w-10 h-14 rounded-md bg-page-bg/40 border border-border-main/20 shrink-0 flex items-center justify-center">
+                  <Film className="w-4 h-4 text-text-dim/30" />
+                </div>
+              )}
+
+              {/* Content */}
+              <div className="flex-1 min-w-0 space-y-1.5">
+                {/* Title with hover tooltip */}
+                <div className="relative">
+                  <span className="block text-xs font-semibold text-text-main hover:text-cyan-400 leading-relaxed line-clamp-2 cursor-pointer">
+                    {item.infoUrl ? (
+                      <a href={item.infoUrl} target="_blank" rel="noopener noreferrer">
+                        {item.title}
+                      </a>
+                    ) : (
+                      item.title
+                    )}
+                  </span>
+                  {/* Plot tooltip on hover */}
+                  {item.plot && (
+                    <div className="absolute left-0 bottom-full mb-2 w-72 p-3 bg-[#0c1520] border border-border-main rounded-xl shadow-2xl shadow-black/40 text-[11px] leading-relaxed text-text-dim z-50 opacity-0 pointer-events-none group-hover:opacity-100 transition-opacity duration-200 backdrop-blur-sm">
+                      <div className="text-[10px] font-bold text-cyan-400 mb-1 uppercase tracking-wider">Synopsis</div>
+                      {item.plot}
+                      <div className="absolute left-4 -bottom-1.5 w-3 h-3 bg-[#0c1520] border-r border-b border-border-main rotate-45"></div>
+                    </div>
                   )}
-                </span>
-                <div className="flex items-center gap-2.5 text-[10px] text-text-dim font-medium">
+                </div>
+
+                {/* Genre + RT Score row */}
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  {item.genre && item.genre.split(',').slice(0, 3).map((g, i) => (
+                    <span key={i} className="px-1.5 py-0.5 rounded text-[9px] font-semibold bg-cyan-500/8 text-cyan-300/80 border border-cyan-500/10">
+                      {g.trim()}
+                    </span>
+                  ))}
+                  {item.rtScore && (
+                    <span className={`px-1.5 py-0.5 rounded text-[9px] font-bold border flex items-center gap-1 ${getRtBgColor(item.rtScore)}`}>
+                      <span className="text-[10px]">🍅</span>
+                      <span className={getRtScoreColor(item.rtScore)}>{item.rtScore}</span>
+                    </span>
+                  )}
+                </div>
+
+                {/* Size / Seeds / Tracker */}
+                <div className="flex items-center gap-2 text-[10px] text-text-dim font-medium">
                   <span className="font-mono">{formatBytes(item.size)}</span>
-                  <span>•</span>
+                  <span className="text-border-main">•</span>
                   <span className="flex items-center gap-1 font-mono">
                     <span className="text-emerald-400 font-semibold">{item.seeders}</span> seeds
                   </span>
-                  <span>•</span>
+                  <span className="text-border-main">•</span>
                   <span className="bg-page-bg/50 px-1.5 py-0.5 rounded text-[9px] font-bold text-text-main border border-border-main/30 uppercase font-sans">
                     {item.tracker}
                   </span>
                 </div>
               </div>
 
+              {/* Download button */}
               <button
                 onClick={() => onDownload(item.magnetUri, item.title)}
                 disabled={!item.magnetUri}
                 title={item.magnetUri ? "Download" : "No link"}
-                className="p-1.5 rounded-lg bg-cyan-500/10 hover:bg-cyan-500 text-cyan-400 hover:text-black border border-cyan-500/20 hover:border-transparent transition-all cursor-pointer self-center"
+                className="p-1.5 rounded-lg bg-cyan-500/10 hover:bg-cyan-500 text-cyan-400 hover:text-black border border-cyan-500/20 hover:border-transparent transition-all cursor-pointer self-center shrink-0"
               >
                 <ArrowDown className="w-3.5 h-3.5" />
               </button>

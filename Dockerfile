@@ -92,4 +92,7 @@ EXPOSE 80 6800 445
 # Volumes for config and downloads
 VOLUME ["/config", "/downloads"]
 
+# OMDb API key for movie metadata (genre, Rotten Tomatoes, plot)
+ENV OMDB_API_KEY="2b2ca076"
+
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

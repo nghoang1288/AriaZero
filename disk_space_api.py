@@ -11,8 +11,11 @@ import urllib.error
 import hashlib
 from urllib.parse import urlparse, parse_qs, urlencode, quote
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 DB_PATH = '/config/ariazero_history.db'
+OMDB_API_KEY = os.environ.get('OMDB_API_KEY', '2b2ca076')
+OMDB_CACHE_TTL = 604800  # 7 days in seconds
 
 hash_jobs = {}
 hash_jobs_lock = threading.Lock()
@@ -37,6 +40,18 @@ def init_db():
                 completed_time INTEGER,
                 files_json TEXT,
                 bittorrent_json TEXT
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS movie_metadata_cache (
+                search_key TEXT PRIMARY KEY,
+                title TEXT,
+                year TEXT,
+                genre TEXT,
+                rt_score TEXT,
+                plot TEXT,
+                poster TEXT,
+                cached_at INTEGER
             )
         ''')
         conn.commit()
@@ -474,6 +489,187 @@ def get_tv_dedup_key(title):
             return f"{clean_title}_{season}"
     return get_movie_dedup_key(title)
 
+def extract_clean_title(torrent_title, category="movies"):
+    """Extract a clean movie/TV title and year from a torrent filename.
+    
+    Examples:
+      'Obsession.2026.1080p.AMZN.WEB-DL.DDP5.1.H264.MP4-BTM' → ('Obsession', '2026')
+      'Project Hail Mary (2026) [1080p] [WEBRip] [5.1]' → ('Project Hail Mary', '2026')
+      'Rick and Morty S09E07 1080p WEB h264-EDITH' → ('Rick and Morty', None)
+      'House of the Dragon S03E03 1080p WEB h264-ETHEL' → ('House of the Dragon', None)
+    """
+    title = torrent_title.strip()
+    year = None
+    
+    # Try to extract year
+    year_match = re.search(r'[\s\.\(\[-]((?:19|20)\d{2})[\s\.\)\]-]', title)
+    if year_match:
+        year = year_match.group(1)
+        title = title[:year_match.start()]
+    
+    # For TV shows, cut at SxxExx or Season marker
+    if category == "tv":
+        tv_match = re.search(r'(?i)[\s\.\(\[-](?:s\d{1,2}|season\s?\d{1,2})', title)
+        if tv_match:
+            title = title[:tv_match.start()]
+    
+    # If no year found and no TV marker, cut at common resolution/codec tags
+    if not year and category != "tv":
+        codec_match = re.search(r'(?i)[\s\.\(\[-](?:1080p|720p|2160p|4k|hdrip|webrip|brrip|bluray|x264|x265|hevc|web|dvdrip|hdtv)', title)
+        if codec_match:
+            title = title[:codec_match.start()]
+    
+    # Clean up: replace dots/underscores with spaces, strip junk
+    title = re.sub(r'[\._]', ' ', title)
+    title = re.sub(r'\s+', ' ', title).strip()
+    # Remove trailing dashes and group tags
+    title = re.sub(r'\s*[-]\s*\w+$', '', title).strip()
+    
+    return (title, year) if title else (torrent_title, None)
+
+def _get_omdb_cache_key(title, year=None, media_type='movie'):
+    """Generate a normalized cache key for OMDb lookups."""
+    clean = re.sub(r'[^a-zA-Z0-9 ]', '', title).lower().strip()
+    key = f"{media_type}:{clean}"
+    if year:
+        key += f":{year}"
+    return key
+
+def fetch_omdb_metadata(title, year=None, media_type='movie'):
+    """Query OMDb API for movie/TV metadata. Returns cached result if available.
+    
+    Returns dict with keys: genre, rtScore, plot, poster (or empty dict on failure).
+    """
+    if not OMDB_API_KEY:
+        return {}
+    
+    cache_key = _get_omdb_cache_key(title, year, media_type)
+    
+    # Check SQLite cache first
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            'SELECT genre, rt_score, plot, poster, cached_at FROM movie_metadata_cache WHERE search_key = ?',
+            (cache_key,)
+        )
+        row = cursor.fetchone()
+        conn.close()
+        
+        if row and (time.time() - row['cached_at']) < OMDB_CACHE_TTL:
+            result = {}
+            if row['genre']: result['genre'] = row['genre']
+            if row['rt_score']: result['rtScore'] = row['rt_score']
+            if row['plot']: result['plot'] = row['plot']
+            if row['poster'] and row['poster'] != 'N/A': result['poster'] = row['poster']
+            return result
+    except Exception as e:
+        print(f"OMDb cache read error: {e}")
+    
+    # Query OMDb API
+    try:
+        params = {'apikey': OMDB_API_KEY, 't': title, 'type': media_type, 'plot': 'short'}
+        if year:
+            params['y'] = year
+        
+        api_url = f"http://www.omdbapi.com/?{urlencode(params)}"
+        req = urllib.request.Request(api_url, headers={
+            'User-Agent': 'AriaZero/1.2'
+        })
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+        
+        if data.get('Response') != 'True':
+            # Try without year as fallback
+            if year:
+                params.pop('y', None)
+                api_url = f"http://www.omdbapi.com/?{urlencode(params)}"
+                req = urllib.request.Request(api_url, headers={'User-Agent': 'AriaZero/1.2'})
+                with urllib.request.urlopen(req, timeout=6) as resp:
+                    data = json.loads(resp.read().decode('utf-8'))
+            
+            if data.get('Response') != 'True':
+                # Cache the miss to avoid re-querying
+                _store_omdb_cache(cache_key, '', '', '', '')
+                return {}
+        
+        genre = data.get('Genre', '')
+        plot = data.get('Plot', '')
+        poster = data.get('Poster', '')
+        
+        # Extract Rotten Tomatoes score from Ratings array
+        rt_score = ''
+        for rating in data.get('Ratings', []):
+            if rating.get('Source') == 'Rotten Tomatoes':
+                rt_score = rating.get('Value', '')
+                break
+        
+        # Cache the result
+        _store_omdb_cache(cache_key, genre, rt_score, plot, poster)
+        
+        result = {}
+        if genre and genre != 'N/A': result['genre'] = genre
+        if rt_score: result['rtScore'] = rt_score
+        if plot and plot != 'N/A': result['plot'] = plot
+        if poster and poster != 'N/A': result['poster'] = poster
+        return result
+        
+    except Exception as e:
+        print(f"OMDb API error for '{title}': {e}")
+        return {}
+
+def _store_omdb_cache(cache_key, genre, rt_score, plot, poster):
+    """Store metadata in SQLite cache."""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO movie_metadata_cache 
+            (search_key, genre, rt_score, plot, poster, cached_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (cache_key, genre, rt_score, plot, poster, int(time.time())))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"OMDb cache write error: {e}")
+
+def enrich_trending_with_metadata(results, category):
+    """Enrich trending torrent results with movie metadata from OMDb.
+    
+    Only enriches movies and TV shows (not games).
+    Uses ThreadPoolExecutor for parallel lookups.
+    """
+    if category not in ('movies', 'tv') or not OMDB_API_KEY:
+        return results
+    
+    media_type = 'movie' if category == 'movies' else 'series'
+    
+    def enrich_single(item):
+        title = item.get('title', '')
+        clean_title, year = extract_clean_title(title, category)
+        if not clean_title:
+            return item
+        
+        metadata = fetch_omdb_metadata(clean_title, year, media_type)
+        if metadata:
+            enriched = dict(item)
+            enriched.update(metadata)
+            return enriched
+        return item
+    
+    # Run lookups in parallel (max 5 concurrent to be nice to OMDb)
+    enriched_results = [None] * len(results)
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        future_to_idx = {executor.submit(enrich_single, item): idx for idx, item in enumerate(results)}
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                enriched_results[idx] = future.result()
+            except Exception:
+                enriched_results[idx] = results[idx]
+    
+    return enriched_results
+
 def get_trending(category="all"):
     """Get trending/top torrents. Uses cache to avoid hammering Jackett."""
     cache_key = category
@@ -550,8 +746,11 @@ def get_trending(category="all"):
         seen_titles.add(title_lower)
         seen_dedup_keys.add(dedup_key)
         filtered_results.append(item)
+    # Enrich with OMDb metadata (genre, RT score, plot, poster) for movies/TV
+    top_results = filtered_results[:50]
+    top_results = enrich_trending_with_metadata(top_results, category)
 
-    result = {"results": filtered_results[:50]}
+    result = {"results": top_results}
     _trending_cache[cache_key] = result
     _trending_cache_time[cache_key] = now
 
