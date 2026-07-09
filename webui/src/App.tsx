@@ -933,11 +933,11 @@ function AppContent({
           
           <button 
             onClick={() => {
-              setActiveTab('settings');
+              setActiveTab('search');
               if (isMobile) setShowMobileSidebar(false);
             }}
             className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm font-medium transition-all cursor-pointer ${
-              activeTab === 'settings' 
+              activeTab === 'search' 
                 ? 'bg-cyan-500/8 text-cyan-400 border-l-2 border-cyan-400' 
                 : 'text-text-dim hover:bg-page-bg/40 hover:text-text-main border-l-2 border-transparent'
             }`}
