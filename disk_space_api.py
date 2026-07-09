@@ -8,6 +8,8 @@ import time
 import urllib.request
 import urllib.error
 import hashlib
+from urllib.parse import urlparse, parse_qs, urlencode
+import xml.etree.ElementTree as ET
 
 DB_PATH = '/config/ariazero_history.db'
 
@@ -333,6 +335,180 @@ def background_poller():
 
 
 
+# === Jackett Integration ===
+
+JACKETT_API_BASE = "http://127.0.0.1:9117"
+JACKETT_CONFIG_PATH = "/config/jackett/ServerConfig.json"
+
+# Cache for trending results
+_trending_cache = {}
+_trending_cache_time = {}
+TRENDING_CACHE_TTL = 1800  # 30 minutes
+
+def get_jackett_api_key():
+    """Read the Jackett API key from its ServerConfig.json file."""
+    try:
+        with open(JACKETT_CONFIG_PATH, 'r') as f:
+            config = json.load(f)
+            return config.get("APIKey", "")
+    except Exception:
+        return ""
+
+def search_jackett(query, categories=None):
+    """Search torrents via Jackett's Torznab API and return parsed results."""
+    api_key = get_jackett_api_key()
+    if not api_key:
+        return {"error": "Jackett API key not found. Please open /jackett/ to configure.", "results": []}
+
+    params = {
+        "apikey": api_key,
+        "Query": query,
+        "t": "search"
+    }
+    if categories:
+        params["cat"] = categories
+
+    url = f"{JACKETT_API_BASE}/jackett/api/v2.0/indexers/all/results/torznab/api?{urlencode(params)}"
+
+    try:
+        req = urllib.request.Request(url, headers={"Accept": "application/xml"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            xml_data = resp.read().decode('utf-8')
+        return parse_torznab_xml(xml_data)
+    except urllib.error.URLError as e:
+        return {"error": f"Jackett connection failed: {str(e)}", "results": []}
+    except Exception as e:
+        return {"error": f"Search failed: {str(e)}", "results": []}
+
+def get_trending(category="all"):
+    """Get trending/top torrents. Uses cache to avoid hammering Jackett."""
+    cache_key = category
+    now = time.time()
+
+    if cache_key in _trending_cache and (now - _trending_cache_time.get(cache_key, 0)) < TRENDING_CACHE_TTL:
+        return _trending_cache[cache_key]
+
+    cat_map = {
+        "movies": "2000",
+        "tv": "5000",
+        "games": "4000",
+        "music": "3000",
+        "software": "4000",
+        "all": ""
+    }
+    cat_id = cat_map.get(category, "")
+
+    result = search_jackett("", categories=cat_id if cat_id else None)
+
+    if "error" not in result or result.get("results"):
+        result["results"] = sorted(result.get("results", []), key=lambda x: x.get("seeders", 0), reverse=True)
+        result["results"] = result["results"][:50]
+        _trending_cache[cache_key] = result
+        _trending_cache_time[cache_key] = now
+
+    return result
+
+def parse_torznab_xml(xml_data):
+    """Parse Torznab XML response into a clean JSON structure."""
+    results = []
+    try:
+        root = ET.fromstring(xml_data)
+        for item in root.iter('item'):
+            title = item.findtext('title', '')
+            size = 0
+            seeders = 0
+            leechers = 0
+            magnet_uri = ""
+            info_url = ""
+            tracker = ""
+            pub_date = ""
+            category = ""
+
+            size_el = item.findtext('size', '0')
+            try:
+                size = int(size_el)
+            except (ValueError, TypeError):
+                size = 0
+
+            pub_date = item.findtext('pubDate', '')
+
+            for attr in item.iter('{http://torznab.com/schemas/2015/feed}attr'):
+                name = attr.get('name', '')
+                value = attr.get('value', '')
+                if name == 'seeders':
+                    try:
+                        seeders = int(value)
+                    except (ValueError, TypeError):
+                        pass
+                elif name == 'peers':
+                    try:
+                        leechers = int(value) - seeders
+                        if leechers < 0:
+                            leechers = 0
+                    except (ValueError, TypeError):
+                        pass
+                elif name == 'magneturl':
+                    magnet_uri = value
+                elif name == 'category':
+                    category = value
+                elif name == 'jackettindexer':
+                    tracker = value
+
+            enclosure = item.find('enclosure')
+            if enclosure is not None and not magnet_uri:
+                enc_url = enclosure.get('url', '')
+                if enc_url.startswith('magnet:'):
+                    magnet_uri = enc_url
+
+            info_url = item.findtext('comments', '') or item.findtext('link', '')
+
+            ji = item.find('jackettindexer')
+            if ji is not None:
+                tracker = ji.text or ji.get('id', '')
+            if not tracker:
+                tracker = "Unknown"
+
+            if title:
+                results.append({
+                    "title": title,
+                    "size": size,
+                    "seeders": seeders,
+                    "leechers": leechers,
+                    "magnetUri": magnet_uri,
+                    "infoUrl": info_url,
+                    "tracker": tracker,
+                    "publishDate": pub_date,
+                    "category": category
+                })
+
+    except ET.ParseError as e:
+        return {"error": f"Failed to parse Jackett response: {str(e)}", "results": []}
+
+    results.sort(key=lambda x: x.get("seeders", 0), reverse=True)
+    return {"results": results}
+
+def get_jackett_status():
+    """Check if Jackett is running and configured correctly."""
+    api_key = get_jackett_api_key()
+    if not api_key:
+        return {"running": False, "message": "Jackett API key not found. Jackett may still be starting up. Visit /jackett/ to configure."}
+
+    try:
+        url = f"{JACKETT_API_BASE}/jackett/api/v2.0/indexers/all/results/torznab/api?apikey={api_key}&t=caps"
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            if resp.getcode() == 200:
+                return {
+                    "running": True,
+                    "message": "Jackett is running and authenticated successfully."
+                }
+            else:
+                return {"running": False, "message": f"Jackett returned status code: {resp.getcode()}"}
+    except Exception as e:
+        return {"running": False, "message": f"Cannot connect to Jackett: {str(e)}"}
+
+
+
 class DiskSpaceHandler(BaseHTTPRequestHandler):
     def _send_cors_headers(self):
         self.send_header('Access-Control-Allow-Origin', '*')
@@ -412,7 +588,6 @@ class DiskSpaceHandler(BaseHTTPRequestHandler):
             if not self.check_auth():
                 return
             try:
-                from urllib.parse import urlparse, parse_qs
                 query = parse_qs(urlparse(self.path).query)
                 path_list = query.get('path')
                 file_path = path_list[0] if path_list else None
@@ -433,6 +608,65 @@ class DiskSpaceHandler(BaseHTTPRequestHandler):
                 self._send_cors_headers()
                 self.end_headers()
                 self.wfile.write(json.dumps(job).encode('utf-8'))
+            except Exception as e:
+                self.send_response(500)
+                self.send_header('Content-Type', 'application/json')
+                self._send_cors_headers()
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
+        elif self.path.startswith('/api/search'):
+            if not self.check_auth():
+                return
+            try:
+                query_params = parse_qs(urlparse(self.path).query)
+                q = query_params.get('q', [''])[0]
+                cat = query_params.get('cat', [''])[0]
+
+                if not q:
+                    result = {"error": "Missing search query parameter 'q'", "results": []}
+                else:
+                    result = search_jackett(q, categories=cat if cat else None)
+
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self._send_cors_headers()
+                self.end_headers()
+                self.wfile.write(json.dumps(result).encode('utf-8'))
+            except Exception as e:
+                self.send_response(500)
+                self.send_header('Content-Type', 'application/json')
+                self._send_cors_headers()
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
+        elif self.path.startswith('/api/trending'):
+            if not self.check_auth():
+                return
+            try:
+                query_params = parse_qs(urlparse(self.path).query)
+                cat = query_params.get('cat', ['all'])[0]
+                result = get_trending(cat)
+
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self._send_cors_headers()
+                self.end_headers()
+                self.wfile.write(json.dumps(result).encode('utf-8'))
+            except Exception as e:
+                self.send_response(500)
+                self.send_header('Content-Type', 'application/json')
+                self._send_cors_headers()
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
+        elif self.path == '/api/jackett-status':
+            if not self.check_auth():
+                return
+            try:
+                result = get_jackett_status()
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self._send_cors_headers()
+                self.end_headers()
+                self.wfile.write(json.dumps(result).encode('utf-8'))
             except Exception as e:
                 self.send_response(500)
                 self.send_header('Content-Type', 'application/json')

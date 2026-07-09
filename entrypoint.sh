@@ -121,6 +121,114 @@ cat <<EOF >> "$SMB_CONF"
    valid users = $SMB_USER
 EOF
 
+# === Jackett Setup ===
+JACKETT_DATA_DIR="/config/jackett"
+JACKETT_INDEXER_DIR="$JACKETT_DATA_DIR/Indexers"
+JACKETT_SERVER_CONFIG="$JACKETT_DATA_DIR/ServerConfig.json"
+
+mkdir -p "$JACKETT_DATA_DIR" "$JACKETT_INDEXER_DIR"
+
+# Create default ServerConfig.json if it doesn't exist
+if [ ! -f "$JACKETT_SERVER_CONFIG" ]; then
+    cat <<'JACKETT_CFG' > "$JACKETT_SERVER_CONFIG"
+{
+  "BasePathOverride": "/jackett",
+  "AllowExternal": true,
+  "UpdateDisabled": true
+}
+JACKETT_CFG
+    echo "Created default Jackett ServerConfig.json"
+fi
+
+# Ensure BasePathOverride is always set to /jackett and AllowExternal is true
+python3 -c "
+import json, os
+p = '$JACKETT_SERVER_CONFIG'
+if os.path.exists(p):
+    try:
+        with open(p, 'r') as f:
+            d = json.load(f)
+        updated = False
+        if d.get('BasePathOverride') != '/jackett':
+            d['BasePathOverride'] = '/jackett'
+            updated = True
+        if d.get('AllowExternal') != True:
+            d['AllowExternal'] = True
+            updated = True
+        if updated:
+            with open(p, 'w') as f:
+                json.dump(d, f, indent=2)
+            print('Successfully updated Jackett ServerConfig.json with proxy overrides')
+    except Exception as e:
+        print('Error updating ServerConfig.json:', e)
+"
+
+# Create the background setup indexers script
+cat <<'SETUP_SCRIPT' > /usr/local/bin/setup_jackett_indexers.py
+import urllib.request
+import urllib.error
+import http.cookiejar
+import json
+import time
+import os
+
+print("Jackett indexer setup script started in background...")
+time.sleep(3) # Give supervisord a head start
+
+cookie_jar = http.cookiejar.CookieJar()
+cookie_handler = urllib.request.HTTPCookieProcessor(cookie_jar)
+opener = urllib.request.build_opener(cookie_handler)
+
+max_attempts = 15
+for attempt in range(max_attempts):
+    try:
+        resp = opener.open("http://127.0.0.1/jackett/UI/Dashboard", timeout=3)
+        if resp.getcode() == 200:
+            print("Jackett is up and running! Proceeding to setup indexers...")
+            break
+    except Exception:
+        pass
+    print(f"Waiting for Jackett to start (attempt {attempt+1}/{max_attempts})...")
+    time.sleep(2)
+else:
+    print("Jackett failed to start within the timeout period. Exiting setup script.")
+    exit(1)
+
+indexers = ["1337x", "thepiratebay", "yts", "eztv", "limetorrents"]
+for idx in indexers:
+    config_file = f"/config/jackett/Indexers/{idx}.json"
+    
+    # Check if already configured (size > 100 bytes)
+    if os.path.exists(config_file) and os.path.getsize(config_file) > 100:
+        print(f"Indexer {idx} is already configured. Skipping.")
+        continue
+        
+    print(f"Configuring indexer: {idx}...")
+    try:
+        url_get = f"http://127.0.0.1/jackett/api/v2.0/indexers/{idx}/config"
+        req_get = urllib.request.Request(url_get, headers={"Accept": "application/json"})
+        with opener.open(req_get, timeout=5) as resp:
+            default_config = json.loads(resp.read().decode('utf-8'))
+            
+        url_post = f"http://127.0.0.1/jackett/api/v2.0/indexers/{idx}/config"
+        req_post = urllib.request.Request(
+            url_post,
+            data=json.dumps(default_config).encode('utf-8'),
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            method="POST"
+        )
+        with opener.open(req_post, timeout=5) as resp:
+            if resp.getcode() in (200, 204):
+                print(f"Successfully configured indexer {idx}!")
+            else:
+                print(f"Failed to configure indexer {idx}. Status code: {resp.getcode()}")
+    except Exception as e:
+        print(f"Error configuring indexer {idx}:", e)
+SETUP_SCRIPT
+
+# Run indexer setup script in background
+python3 -u /usr/local/bin/setup_jackett_indexers.py &
+
 # Execute supervisor
 echo "Starting Supervisor process manager..."
 exec supervisord -c /etc/supervisor/conf.d/supervisord.conf

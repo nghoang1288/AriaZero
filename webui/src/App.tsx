@@ -48,6 +48,7 @@ import TaskDetailsDrawer from './components/TaskDetailsDrawer';
 import DashboardPage from './components/DashboardPage';
 import DownloadsPage from './components/DownloadsPage';
 import Sparkline from './components/Sparkline';
+import SearchTorrentsPage from './components/SearchTorrentsPage';
 
 function App() {
   const {
@@ -82,7 +83,7 @@ function App() {
 
   const { showToast } = useToast();
 
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'downloads' | 'settings'>('dashboard');
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'downloads' | 'search' | 'settings'>('dashboard');
   const [showAddModal, setShowAddModal] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedCategory, setSelectedCategory] = useState<string>('all');
@@ -360,8 +361,8 @@ function App() {
 }
 
 interface AppContentProps {
-  activeTab: 'dashboard' | 'downloads' | 'settings';
-  setActiveTab: React.Dispatch<React.SetStateAction<'dashboard' | 'downloads' | 'settings'>>;
+  activeTab: 'dashboard' | 'downloads' | 'search' | 'settings';
+  setActiveTab: React.Dispatch<React.SetStateAction<'dashboard' | 'downloads' | 'search' | 'settings'>>;
   showAddModal: boolean;
   setShowAddModal: React.Dispatch<React.SetStateAction<boolean>>;
   searchQuery: string;
@@ -941,6 +942,21 @@ function AppContent({
                 : 'text-text-dim hover:bg-page-bg/40 hover:text-text-main border-l-2 border-transparent'
             }`}
           >
+            <Search className="w-4 h-4" />
+            Search Torrents
+          </button>
+          
+          <button 
+            onClick={() => {
+              setActiveTab('settings');
+              if (isMobile) setShowMobileSidebar(false);
+            }}
+            className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-lg text-sm font-medium transition-all cursor-pointer ${
+              activeTab === 'settings' 
+                ? 'bg-cyan-500/8 text-cyan-400 border-l-2 border-cyan-400' 
+                : 'text-text-dim hover:bg-page-bg/40 hover:text-text-main border-l-2 border-transparent'
+            }`}
+          >
             <Settings className="w-4 h-4" />
             Settings
           </button>
@@ -1063,7 +1079,9 @@ function AppContent({
             >
               <Menu className="w-4.5 h-4.5" />
             </button>
-            <h1 className="text-md md:text-lg font-semibold text-text-main capitalize">{activeTab}</h1>
+            <h1 className="text-md md:text-lg font-semibold text-text-main capitalize">
+              {activeTab === 'search' ? 'Search Torrents' : activeTab}
+            </h1>
             <div className="hidden sm:block">
               {getStatusBadge()}
             </div>
@@ -1157,6 +1175,13 @@ function AppContent({
             />
           )}
 
+          {activeTab === 'search' && (
+            <SearchTorrentsPage
+              addUri={addUri}
+              showToast={showToast}
+            />
+          )}
+
         </div>
 
         {/* Global speed indicator at bottom */}
@@ -1165,7 +1190,7 @@ function AppContent({
             <span className="flex items-center gap-1.5 font-semibold text-text-main">
               AriaZero
               <span className="text-[10px] bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 px-1.5 py-0.5 rounded font-mono font-bold">
-                v1.1.0
+                v1.2.0
               </span>
             </span>
             <span className="hidden lg:inline text-[10px] text-text-dim/60 font-mono">Real-time Graphs • Task details drawer • Bandwidth scheduler</span>
