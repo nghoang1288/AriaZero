@@ -460,6 +460,12 @@ function AppContent({
 
   const retryCountsRef = useRef<Map<string, number>>(new Map());
 
+  // Ref to hold the latest tasks to check for existence during scheduled retries
+  const allTasksRef = useRef<Aria2Task[]>([]);
+  useEffect(() => {
+    allTasksRef.current = [...activeTasks, ...waitingTasks, ...stoppedTasks];
+  }, [activeTasks, waitingTasks, stoppedTasks]);
+
   // Disk Space State
   interface DiskSpaceInfo {
     total: number;
@@ -747,7 +753,12 @@ function AppContent({
             });
 
             setTimeout(() => {
-              retryTask(failedTask);
+              const taskStillExists = allTasksRef.current.some(t => t.gid === event.gid);
+              if (taskStillExists) {
+                retryTask(failedTask);
+              } else {
+                console.log(`Task ${event.gid} was deleted by user during retry delay. Skipping retry.`);
+              }
             }, retryDelaySec * 1000);
           } else {
             showToast({
