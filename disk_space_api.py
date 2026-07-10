@@ -63,6 +63,30 @@ def get_db_connection():
     conn.row_factory = sqlite3.Row
     return conn
 
+def call_aria2_rpc(method, params):
+    try:
+        secret = os.environ.get('ARIA2_RPC_SECRET')
+        aria2_port = os.environ.get('ARIA2_RPC_PORT', '6800')
+        url = f"http://127.0.0.1:{aria2_port}/jsonrpc"
+        headers = {"Content-Type": "application/json"}
+        
+        rpc_params = [f"token:{secret}"] if secret else []
+        rpc_params.extend(params)
+        
+        payload = {
+            "jsonrpc": "2.0",
+            "id": "ariazero_rpc_helper",
+            "method": method,
+            "params": rpc_params
+        }
+        req_data = json.dumps(payload).encode('utf-8')
+        req = urllib.request.Request(url, data=req_data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=5) as response:
+            return json.loads(response.read().decode('utf-8'))
+    except Exception as e:
+        print(f"Error in call_aria2_rpc {method}: {e}")
+        return None
+
 def fetch_history():
     conn = get_db_connection()
     try:
@@ -113,6 +137,12 @@ def fetch_history():
         conn.close()
 
 def delete_history_record(gid):
+    # Synchronously remove download result from aria2 memory
+    call_aria2_rpc("aria2.removeDownloadResult", [gid])
+    
+    # Force save the session file immediately
+    call_aria2_rpc("aria2.saveSession", [])
+
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
@@ -129,6 +159,12 @@ def delete_history_record(gid):
         conn.close()
 
 def clear_history():
+    # Purge all stopped/completed tasks from aria2 memory
+    call_aria2_rpc("aria2.purgeDownloadResult", [])
+    
+    # Force save the session file immediately
+    call_aria2_rpc("aria2.saveSession", [])
+
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
