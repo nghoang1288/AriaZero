@@ -28,7 +28,7 @@ min-split-size=10M
 split=16
 max-concurrent-downloads=5
 allow-overwrite=true
-force-save=true
+force-save=false
 check-integrity=true
 EOF
 fi
@@ -41,11 +41,12 @@ if [ -n "$ARIA2_RPC_SECRET" ]; then
     echo "rpc-secret=$ARIA2_RPC_SECRET" >> "$CONF_FILE"
 fi
 
-# Ensure force-save=true is set to preserve completed tasks across restarts
+# Ensure force-save=false so completed/removed tasks don't pollute the session file.
+# History is maintained by the SQLite database instead.
 if ! grep -q "^force-save=" "$CONF_FILE"; then
-    echo "force-save=true" >> "$CONF_FILE"
+    echo "force-save=false" >> "$CONF_FILE"
 else
-    sed -i 's/^force-save=.*/force-save=true/' "$CONF_FILE"
+    sed -i 's/^force-save=.*/force-save=false/' "$CONF_FILE"
 fi
 
 # Ensure check-integrity=true is set to verify existing files and allow proper resumes

@@ -596,10 +596,16 @@ function AppContent({
         message: 'An error occurred while trying to delete files from disk.'
       });
     } finally {
-      removeTask(taskToRemove.gid, taskToRemove.status);
-      if (taskToRemove.status === 'complete' || taskToRemove.status === 'error' || taskToRemove.status === 'removed') {
-        await deleteHistoryTask(taskToRemove.gid);
+      // Await removeTask so aria2 fully processes forceRemove/removeDownloadResult
+      // before the backend API tries to clean up the same task
+      try {
+        await removeTask(taskToRemove.gid, taskToRemove.status);
+      } catch (e) {
+        // Ignore errors - task may already be removed
       }
+      // Always delete from history regardless of status to prevent
+      // background poller from re-inserting the task into SQLite
+      await deleteHistoryTask(taskToRemove.gid);
       setTaskToRemove(null);
       setIsDeletingFiles(false);
       setTimeout(fetchDiskSpace, 1000);
@@ -687,10 +693,12 @@ function AppContent({
       }
 
       addUri(url);
-      removeTask(task.gid, task.status);
-      if (task.status === 'complete' || task.status === 'error' || task.status === 'removed') {
-        await deleteHistoryTask(task.gid);
+      try {
+        await removeTask(task.gid, task.status);
+      } catch (e) {
+        // Ignore errors - task may already be removed
       }
+      await deleteHistoryTask(task.gid);
       showToast({
         type: 'success',
         title: 'Retrying Download',

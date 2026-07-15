@@ -20,6 +20,12 @@ OMDB_CACHE_TTL = 604800  # 7 days in seconds
 hash_jobs = {}
 hash_jobs_lock = threading.Lock()
 
+# Blocklist of GIDs that have been explicitly deleted by the user.
+# The background poller checks this set and skips these GIDs to prevent
+# re-inserting them into SQLite before aria2 finishes processing the removal.
+_deleted_gids = set()
+_deleted_gids_lock = threading.Lock()
+
 def init_db():
     db_dir = os.path.dirname(DB_PATH)
     if db_dir:
@@ -137,8 +143,23 @@ def fetch_history():
         conn.close()
 
 def delete_history_record(gid):
-    # Synchronously remove download result from aria2 memory
-    call_aria2_rpc("aria2.removeDownloadResult", [gid])
+    # Add to blocklist FIRST to prevent background poller race condition
+    with _deleted_gids_lock:
+        _deleted_gids.add(gid)
+
+    # Try forceRemove first (handles active/waiting/paused tasks)
+    result = call_aria2_rpc("aria2.forceRemove", [gid])
+    if result and "result" in result:
+        # forceRemove succeeded - task is transitioning to stopped state.
+        # Wait briefly for aria2 to fully transition the task.
+        time.sleep(0.3)
+    
+    # Remove from stopped list (handles complete/error/removed tasks)
+    result = call_aria2_rpc("aria2.removeDownloadResult", [gid])
+    if result is None or "error" in str(result):
+        # Retry after a short delay in case the task hasn't fully transitioned
+        time.sleep(0.3)
+        call_aria2_rpc("aria2.removeDownloadResult", [gid])
     
     # Force save the session file immediately
     call_aria2_rpc("aria2.saveSession", [])
@@ -149,16 +170,43 @@ def delete_history_record(gid):
         # Find the name associated with this gid to delete all duplicates together
         cursor.execute('SELECT name FROM download_history WHERE gid = ?', (gid,))
         row = cursor.fetchone()
+        deleted_gids_from_db = []
         if row and row["name"] and row["name"] != "Unknown":
+            # Also find all related GIDs to add to blocklist
+            cursor.execute('SELECT gid FROM download_history WHERE name = ?', (row["name"],))
+            deleted_gids_from_db = [r["gid"] for r in cursor.fetchall()]
             cursor.execute('DELETE FROM download_history WHERE name = ?', (row["name"],))
         else:
             cursor.execute('DELETE FROM download_history WHERE gid = ?', (gid,))
         conn.commit()
+        
+        # Add all related GIDs to blocklist and remove from aria2
+        for related_gid in deleted_gids_from_db:
+            with _deleted_gids_lock:
+                _deleted_gids.add(related_gid)
+            if related_gid != gid:
+                call_aria2_rpc("aria2.forceRemove", [related_gid])
+                call_aria2_rpc("aria2.removeDownloadResult", [related_gid])
+        
+        if deleted_gids_from_db:
+            call_aria2_rpc("aria2.saveSession", [])
+        
         return cursor.rowcount > 0
     finally:
         conn.close()
 
 def clear_history():
+    # Add all existing history GIDs to blocklist
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute('SELECT gid FROM download_history')
+        with _deleted_gids_lock:
+            for r in cursor.fetchall():
+                _deleted_gids.add(r["gid"])
+    finally:
+        conn.close()
+
     # Purge all stopped/completed tasks from aria2 memory
     call_aria2_rpc("aria2.purgeDownloadResult", [])
     
@@ -207,6 +255,10 @@ def upsert_history_records(tasks):
             gid = task.get('gid')
             if not gid:
                 continue
+            # Skip GIDs that have been explicitly deleted by the user
+            with _deleted_gids_lock:
+                if gid in _deleted_gids:
+                    continue
             name = get_task_name(task)
             
             try:
