@@ -468,7 +468,9 @@ interface TrendingSectionProps {
 }
 
 function getRtScoreColor(score: string): string {
-  const num = parseInt(score);
+  const isImdb = score.startsWith('IMDb:');
+  const valStr = isImdb ? score.substring(5) : score;
+  const num = isImdb ? parseFloat(valStr) * 10 : parseInt(valStr);
   if (isNaN(num)) return 'text-text-dim';
   if (num >= 75) return 'text-emerald-400';
   if (num >= 60) return 'text-amber-400';
@@ -476,7 +478,9 @@ function getRtScoreColor(score: string): string {
 }
 
 function getRtBgColor(score: string): string {
-  const num = parseInt(score);
+  const isImdb = score.startsWith('IMDb:');
+  const valStr = isImdb ? score.substring(5) : score;
+  const num = isImdb ? parseFloat(valStr) * 10 : parseInt(valStr);
   if (isNaN(num)) return 'bg-white/5';
   if (num >= 75) return 'bg-emerald-500/10 border-emerald-500/20';
   if (num >= 60) return 'bg-amber-500/10 border-amber-500/20';
@@ -542,8 +546,10 @@ function TrendingSection({ title, icon, items, onDownload }: TrendingSectionProp
                   ))}
                   {item.rtScore && (
                     <span className={`px-1.5 py-0.5 rounded text-[9px] font-bold border flex items-center gap-1 ${getRtBgColor(item.rtScore)}`}>
-                      <span className="text-[10px]">🍅</span>
-                      <span className={getRtScoreColor(item.rtScore)}>{item.rtScore}</span>
+                      <span className="text-[10px]">{item.rtScore.startsWith('IMDb:') ? '⭐' : '🍅'}</span>
+                      <span className={getRtScoreColor(item.rtScore)}>
+                        {item.rtScore.startsWith('IMDb:') ? item.rtScore.substring(5) : item.rtScore}
+                      </span>
                     </span>
                   )}
                 </div>

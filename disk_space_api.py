@@ -708,6 +708,12 @@ def fetch_omdb_metadata(title, year=None, media_type='movie', omdb_key=None):
             if rating.get('Source') == 'Rotten Tomatoes':
                 rt_score = rating.get('Value', '')
                 break
+                
+        # Fallback to IMDb rating if Rotten Tomatoes is missing
+        if not rt_score:
+            imdb = data.get('imdbRating', '')
+            if imdb and imdb != 'N/A':
+                rt_score = f"IMDb:{imdb}"
         
         # Cache the result
         _store_omdb_cache(cache_key, genre, rt_score, plot, poster)
