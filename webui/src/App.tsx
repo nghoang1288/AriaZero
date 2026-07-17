@@ -109,24 +109,40 @@ function App() {
     let mergedOptions = { ...options };
     if (autoCategorizeEnabled && baseDir) {
       let filename = '';
-      try {
-        const cleanUri = sanitizedUri.split('?')[0].split('#')[0];
-        const parts = cleanUri.split('/');
-        filename = decodeURIComponent(parts[parts.length - 1] || '');
-      } catch (e) {
-        const parts = sanitizedUri.split('/');
-        filename = decodeURIComponent(parts[parts.length - 1] || '');
+      if (sanitizedUri.startsWith('magnet:')) {
+        const match = sanitizedUri.match(/[?&]dn=([^&]+)/);
+        if (match) {
+          filename = decodeURIComponent(match[1]).replace(/\+/g, ' ');
+        }
+      } else {
+        try {
+          const cleanUri = sanitizedUri.split('?')[0].split('#')[0];
+          const parts = cleanUri.split('/');
+          filename = decodeURIComponent(parts[parts.length - 1] || '');
+        } catch (e) {
+          const parts = sanitizedUri.split('/');
+          filename = decodeURIComponent(parts[parts.length - 1] || '');
+        }
       }
 
       if (filename) {
         const category = getFileCategory(filename);
         let subfolder = '';
-        if (category === 'video') subfolder = localStorage.getItem('ariazero_video_folder') || 'Video';
+        
+        if (category === 'video' || filename.match(/\.(mkv|mp4|avi|mov|wmv|flv|webm)$/i)) {
+          // Detect if it's a TV Series based on naming pattern
+          const tvPattern = /\bS\d{1,2}E\d{1,2}\b|\bSeason\s*\d+\b/i;
+          if (tvPattern.test(filename)) {
+            subfolder = 'TV Series';
+          } else {
+            subfolder = 'Movies';
+          }
+        }
         else if (category === 'audio') subfolder = localStorage.getItem('ariazero_audio_folder') || 'Audio';
         else if (category === 'documents') subfolder = localStorage.getItem('ariazero_doc_folder') || 'Documents';
         else if (category === 'software') subfolder = localStorage.getItem('ariazero_software_folder') || 'Software';
 
-        if (subfolder) {
+        if (subfolder && !mergedOptions.dir) {
           const cleanBaseDir = baseDir.replace(/[/\\]$/, '');
           mergedOptions.dir = `${cleanBaseDir}/${subfolder}`;
         }
