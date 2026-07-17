@@ -447,7 +447,23 @@ JACKETT_CONFIG_PATH = "/config/jackett/ServerConfig.json"
 # Cache for trending results
 _trending_cache = {}
 _trending_cache_time = {}
-TRENDING_CACHE_TTL = 1800  # 30 minutes
+TRENDING_CACHE_TTL = 21600  # 6 hours
+
+def trending_poller():
+    """Periodically pre-fetch trending data every 6 hours so it loads instantly for the user."""
+    # Initial delay to let the server start up and Jackett to be ready
+    time.sleep(10)
+    while True:
+        try:
+            print("Pre-fetching trending data in background...")
+            get_trending(category="movies", force_refresh=True)
+            get_trending(category="tv", force_refresh=True)
+            get_trending(category="games", force_refresh=True)
+            print("Trending data pre-fetched successfully.")
+        except Exception as e:
+            print(f"Error in trending_poller: {e}")
+        # Sleep for 6 hours
+        time.sleep(21600)
 
 def get_jackett_api_key():
     """Read the Jackett API key from its ServerConfig.json file."""
@@ -766,12 +782,12 @@ def enrich_trending_with_metadata(results, category, omdb_key=None):
     
     return enriched_results
 
-def get_trending(category="all", omdb_key=None):
+def get_trending(category="all", omdb_key=None, force_refresh=False):
     """Get trending/top torrents. Uses cache to avoid hammering Jackett."""
     cache_key = category
     now = time.time()
 
-    if cache_key in _trending_cache and (now - _trending_cache_time.get(cache_key, 0)) < TRENDING_CACHE_TTL:
+    if not force_refresh and cache_key in _trending_cache and (now - _trending_cache_time.get(cache_key, 0)) < TRENDING_CACHE_TTL:
         return _trending_cache[cache_key]
 
     results = []
@@ -1336,6 +1352,10 @@ def run(port=8080):
     init_db()
     t = threading.Thread(target=background_poller, daemon=True)
     t.start()
+    
+    # Start the trending poller to pre-fetch data every 6 hours
+    t2 = threading.Thread(target=trending_poller, daemon=True)
+    t2.start()
     
     server_address = ('127.0.0.1', port)
     httpd = ThreadingHTTPServer(server_address, DiskSpaceHandler)
