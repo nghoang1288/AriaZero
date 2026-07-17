@@ -780,7 +780,7 @@ def get_trending(category="all", omdb_key=None):
     apibay_results = []
     if category == "movies":
         apibay_results += fetch_apibay_top100("201")
-        apibay_results += fetch_apibay_top100("200")
+        apibay_results += fetch_apibay_top100("207")  # 207 is HD - Movies, 200 is All Video (includes TV)
     elif category == "tv":
         apibay_results += fetch_apibay_top100("208")
         apibay_results += fetch_apibay_top100("205")
@@ -801,7 +801,7 @@ def get_trending(category="all", omdb_key=None):
     cat_id = cat_map.get(category, "")
 
     t_type = "movie" if category == "movies" else ("tvsearch" if category == "tv" else "search")
-    cat_to_pass = None if category in ("movies", "tv") else (cat_id if cat_id else None)
+    cat_to_pass = cat_id if cat_id else None
 
     jackett_res = search_jackett("", categories=cat_to_pass, t=t_type)
     if "results" in jackett_res:
@@ -818,6 +818,8 @@ def get_trending(category="all", omdb_key=None):
     
     # Exclude CJK (Chinese/Japanese/Korean) and Cyrillic (Russian) characters to ensure English-only titles
     english_only_pattern = re.compile(r'[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff\uac00-\ud7a3\u0400-\u04ff]')
+    # Regex to detect TV show patterns: S01E01, Season 1, etc.
+    tv_pattern = re.compile(r'(?i)\bS\d{1,2}E\d{1,2}\b|\bSeason\s*\d+\b')
 
     for item in results:
         title = item.get("title", "")
@@ -825,6 +827,10 @@ def get_trending(category="all", omdb_key=None):
         if english_only_pattern.search(title):
             continue
             
+        # Filter out TV shows if we are requesting movies
+        if category == "movies" and tv_pattern.search(title):
+            continue
+
         magnet = item.get("magnetUri", "")
         title_lower = title.lower().strip()
         
