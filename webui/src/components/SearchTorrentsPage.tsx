@@ -5,7 +5,7 @@ import { useApiUrl } from '../hooks/useApiUrl';
 import type { ToastMessage } from '../Toast';
 
 interface SearchTorrentsPageProps {
-  addUri: (uri: string) => void;
+  addUri: (uri: string, options?: Record<string, string>) => void;
   showToast: (toast: Omit<ToastMessage, 'id'>) => void;
 }
 
@@ -187,13 +187,30 @@ export default function SearchTorrentsPage({ addUri, showToast }: SearchTorrents
     return list;
   }, [searchResults, sortField]);
 
+  const getCategoryNameForDownload = () => {
+    if (activeCategory === 'movies') return 'Popular Movies';
+    if (activeCategory === 'tv') return 'TV Series';
+    if (activeCategory === 'games') return 'Trending Games';
+    return undefined;
+  };
+
   // Trigger download helper
-  const handleDownload = (magnetUri: string, title: string) => {
+  const handleDownload = (magnetUri: string, title: string, category?: string) => {
     if (!magnetUri) {
       showToast({ title: 'Download Error', message: 'No download link (magnet URI) found for this torrent', type: 'error' });
       return;
     }
-    addUri(magnetUri);
+    
+    const options: Record<string, string> = {};
+    if (category === 'Popular Movies') {
+      options.dir = '/downloads/Movies';
+    } else if (category === 'TV Series') {
+      options.dir = '/downloads/TV Series';
+    } else if (category === 'Trending Games') {
+      options.dir = '/downloads/Games';
+    }
+    
+    addUri(magnetUri, Object.keys(options).length > 0 ? options : undefined);
     showToast({ title: 'Download Started', message: `Downloading: ${title.slice(0, 40)}...`, type: 'success' });
   };
 
@@ -388,7 +405,7 @@ export default function SearchTorrentsPage({ addUri, showToast }: SearchTorrents
                       </td>
                       <td className="p-4 text-center">
                         <button
-                          onClick={() => handleDownload(item.magnetUri, item.title)}
+                          onClick={() => handleDownload(item.magnetUri, item.title, getCategoryNameForDownload())}
                           disabled={!item.magnetUri}
                           title={item.magnetUri ? "Download Torrent" : "Download URL not found"}
                           className="p-2 rounded-lg bg-cyan-500/10 hover:bg-cyan-500 text-cyan-400 hover:text-black border border-cyan-500/20 hover:border-transparent transition-all cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed"
@@ -464,7 +481,7 @@ interface TrendingSectionProps {
   title: string;
   icon: React.ReactNode;
   items: TorrentResult[];
-  onDownload: (magnetUri: string, title: string) => void;
+  onDownload: (magnetUri: string, title: string, category?: string) => void;
 }
 
 function getRtScoreColor(score: string): string {
