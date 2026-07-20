@@ -412,7 +412,7 @@ def background_poller():
                 "jsonrpc": "2.0",
                 "id": "ariazero_history_poller",
                 "method": "aria2.tellStopped",
-                "params": [f"token:{secret}", -1, 1000] if secret else [-1, 1000]
+                "params": [f"token:{secret}", 0, 1000] if secret else [0, 1000]
             }
             aria2_port = os.environ.get('ARIA2_RPC_PORT', '6800')
             url = f"http://127.0.0.1:{aria2_port}/jsonrpc"
