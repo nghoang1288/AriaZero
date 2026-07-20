@@ -1216,7 +1216,7 @@ function AppContent({
 
           {activeTab === 'search' && (
             <SearchTorrentsPage
-              addUri={addUri}
+              addUri={addUriWithCategory}
               showToast={showToast}
             />
           )}
