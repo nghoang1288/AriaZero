@@ -107,17 +107,21 @@ export default function DownloadsPage({
                 onClick={() => setSelectedCategory(cat.id)}
                 className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-semibold border transition-all cursor-pointer ${
                   isSelected
-                    ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400 font-bold'
+                    ? cat.id === 'error'
+                      ? 'bg-rose-500/10 border-rose-500/30 text-rose-400 font-bold'
+                      : 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400 font-bold'
                     : 'bg-page-bg/30 border-border-main text-text-dim hover:text-text-main hover:bg-page-bg/60'
                 }`}
               >
-                <Icon className="w-3.5 h-3.5" />
+                <Icon className={`w-3.5 h-3.5 ${cat.id === 'error' && !isSelected ? 'text-rose-400/80' : ''}`} />
                 <span>{cat.label}</span>
                 {cat.count > 0 && (
                   <span className={`text-[9px] px-1.5 py-0.5 rounded-full font-mono ${
-                    isSelected
-                      ? 'bg-cyan-500/20 text-cyan-400 border border-cyan-500/20'
-                      : 'bg-border-main border border-border-main/20 text-text-dim'
+                    cat.id === 'error'
+                      ? 'bg-rose-500/20 text-rose-400 border border-rose-500/20'
+                      : isSelected
+                        ? 'bg-cyan-500/20 text-cyan-400 border border-cyan-500/20'
+                        : 'bg-border-main border border-border-main/20 text-text-dim'
                   }`}>
                     {cat.count}
                   </span>

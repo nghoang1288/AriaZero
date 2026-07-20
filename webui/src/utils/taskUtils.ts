@@ -80,6 +80,8 @@ export function filterTaskByCategory(task: Aria2Task, category: string): boolean
       return (task.status === 'active' || task.status === 'waiting') && !isTorrentCompleted(task);
     case 'completed':
       return task.status === 'complete' || isTorrentCompleted(task);
+    case 'error':
+      return task.status === 'error';
     case 'torrents':
       return isTorrent(task);
     case 'video':

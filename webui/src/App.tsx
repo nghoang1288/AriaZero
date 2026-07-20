@@ -813,6 +813,7 @@ function AppContent({
   const categoryCounts = useMemo(() => {
     let active = 0;
     let completed = 0;
+    let error = 0;
     let torrent = 0;
     let video = 0;
     let audio = 0;
@@ -833,6 +834,8 @@ function AppContent({
       if (isMetadataTask(t)) return;
       if (t.status === 'complete') {
         completed++;
+      } else if (t.status === 'error') {
+        error++;
       }
     });
 
@@ -845,13 +848,14 @@ function AppContent({
       else if (isSoftware(ext)) software++;
     });
 
-    return { active, completed, torrent, video, audio, doc, software };
+    return { active, completed, error, torrent, video, audio, doc, software };
   }, [allActiveAndWaiting, stoppedTasks, allTasks]);
 
   const categories = useMemo(() => [
     { id: 'all', label: 'All Tasks', icon: Folder, count: allTasks.length },
     { id: 'active', label: 'Active', icon: Activity, count: categoryCounts.active },
     { id: 'completed', label: 'Completed', icon: CheckCircle, count: categoryCounts.completed },
+    { id: 'error', label: 'Error', icon: AlertCircle, count: categoryCounts.error },
     { id: 'torrents', label: 'Torrents', icon: Share2, count: categoryCounts.torrent },
     { id: 'video', label: 'Video', icon: Film, count: categoryCounts.video },
     { id: 'audio', label: 'Audio', icon: Music, count: categoryCounts.audio },
