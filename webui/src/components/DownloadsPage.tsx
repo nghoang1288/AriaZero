@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useMemo, useState, memo } from 'react';
 import { ArrowUp, Pause, Play, Trash2, AlertCircle, Check } from 'lucide-react';
 import { formatBytes, formatSpeed } from '../useAria2';
 import type { Aria2Task } from '../useAria2';
@@ -257,6 +257,7 @@ export default function DownloadsPage({
                                 onClick={() => pauseTask(task.gid)}
                                 className="text-text-dim hover:text-cyan-400 p-1.5 rounded transition-colors cursor-pointer"
                                 title="Pause Seeding"
+                                aria-label="Pause Seeding"
                               >
                                 <Pause className="w-4 h-4" />
                               </button>
@@ -265,6 +266,7 @@ export default function DownloadsPage({
                                 onClick={() => resumeTask(task.gid)}
                                 className="text-text-dim hover:text-emerald-400 p-1.5 rounded transition-colors cursor-pointer"
                                 title="Resume Seeding"
+                                aria-label="Resume Seeding"
                               >
                                 <Play className="w-4 h-4" />
                               </button>
@@ -274,6 +276,7 @@ export default function DownloadsPage({
                             onClick={() => handleInitiateRemove(task)}
                             className="text-text-dim hover:text-rose-400 p-1.5 rounded transition-colors cursor-pointer"
                             title="Delete task from history"
+                            aria-label="Delete task from history"
                           >
                             <Trash2 className="w-4 h-4" />
                           </button>
@@ -304,3 +307,5 @@ export default function DownloadsPage({
     </div>
   );
 }
+
+export const DownloadsPageMemo = memo(DownloadsPage);

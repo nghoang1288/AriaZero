@@ -323,11 +323,9 @@ export function useAria2() {
     cleanup();
     setStatus('connecting');
 
-    // Build URL: fallback to .226 if running in Vite dev port 5173
-    const devHost = '192.168.50.226';
-    const devPort = '16980';
-    const host = location.port === '5173' ? devHost : location.hostname;
-    const port = location.port === '5173' ? devPort : (location.port || (location.protocol === 'https:' ? '443' : '80'));
+    // Build URL dynamically based on location
+    const host = location.hostname;
+    const port = location.port === '5173' ? '16980' : (location.port || (location.protocol === 'https:' ? '443' : '80'));
     const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
     const wsUrl = `${protocol}://${host}:${port}/jsonrpc`;
 

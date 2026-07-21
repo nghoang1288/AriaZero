@@ -89,13 +89,16 @@ export function SmartDownloadProvider({
     onLinkDetectedRef.current(trimmed, source);
   }, []);
 
+  const lastClipboardTextRef = useRef<string>('');
+
   // -----------------------------------------------------------------------
   // Helper: read clipboard and emit any detected URL
   // -----------------------------------------------------------------------
   const readClipboardAndEmit = useCallback(async (source: 'clipboard' = 'clipboard') => {
     try {
       const text = await navigator.clipboard.readText();
-      if (text) {
+      if (text && text.trim() !== lastClipboardTextRef.current) {
+        lastClipboardTextRef.current = text.trim();
         const urls = extractUrls(text, downloadRegex);
         if (urls.length > 0) {
           emitUrl(urls[0], source);

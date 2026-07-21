@@ -60,6 +60,8 @@ def init_db():
                 cached_at INTEGER
             )
         ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_dh_completed_time ON download_history(completed_time DESC)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_dh_name ON download_history(name)')
         conn.commit()
     finally:
         conn.close()
@@ -167,30 +169,9 @@ def delete_history_record(gid):
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
-        # Find the name associated with this gid to delete all duplicates together
-        cursor.execute('SELECT name FROM download_history WHERE gid = ?', (gid,))
-        row = cursor.fetchone()
-        deleted_gids_from_db = []
-        if row and row["name"] and row["name"] != "Unknown":
-            # Also find all related GIDs to add to blocklist
-            cursor.execute('SELECT gid FROM download_history WHERE name = ?', (row["name"],))
-            deleted_gids_from_db = [r["gid"] for r in cursor.fetchall()]
-            cursor.execute('DELETE FROM download_history WHERE name = ?', (row["name"],))
-        else:
-            cursor.execute('DELETE FROM download_history WHERE gid = ?', (gid,))
+        cursor.execute('DELETE FROM download_history WHERE gid = ?', (gid,))
         conn.commit()
-        
-        # Add all related GIDs to blocklist and remove from aria2
-        for related_gid in deleted_gids_from_db:
-            with _deleted_gids_lock:
-                _deleted_gids.add(related_gid)
-            if related_gid != gid:
-                call_aria2_rpc("aria2.forceRemove", [related_gid])
-                call_aria2_rpc("aria2.removeDownloadResult", [related_gid])
-        
-        if deleted_gids_from_db:
-            call_aria2_rpc("aria2.saveSession", [])
-        
+        call_aria2_rpc("aria2.saveSession", [])
         return cursor.rowcount > 0
     finally:
         conn.close()
@@ -307,27 +288,22 @@ def calculate_sha256_thread(file_path):
                 read_size += len(byte_block)
                 progress = int((read_size / total_size) * 100) if total_size > 0 else 100
                 with hash_jobs_lock:
-                    hash_jobs[file_path] = {
-                        "status": "processing",
-                        "progress": progress,
-                        "read_bytes": read_size,
-                        "total_bytes": total_size
-                    }
+                    if file_path in hash_jobs:
+                        hash_jobs[file_path] = {
+                            "status": "processing",
+                            "progress": progress,
+                            "read_bytes": read_size,
+                            "total_bytes": total_size
+                        }
                     
         hash_hex = sha256_hash.hexdigest()
         with hash_jobs_lock:
-            hash_jobs[file_path] = {
-                "status": "completed",
-                "progress": 100,
-                "hash": hash_hex,
-                "total_bytes": total_size
-            }
+            if file_path in hash_jobs:
+                hash_jobs[file_path] = {"status": "completed", "progress": 100, "hash": hash_hex, "completed_at": time.time()}
     except Exception as e:
         with hash_jobs_lock:
-            hash_jobs[file_path] = {
-                "status": "failed",
-                "error": str(e)
-            }
+            if file_path in hash_jobs:
+                hash_jobs[file_path] = {"status": "failed", "progress": 0, "error": str(e), "completed_at": time.time()}
 
 def get_active_aria2_paths():
     active_paths = set()
@@ -399,9 +375,8 @@ def cleanup_orphaned_aria2_files():
                 if file_path not in active_paths:
                     try:
                         os.remove(file_path)
-                        print(f"Cleaned up orphaned control file: {file_path}")
-                    except Exception as e:
-                        print(f"Failed to remove control file {file_path}: {e}")
+                    except Exception:
+                        pass
 
 def background_poller():
     cleanup_counter = 0
@@ -432,41 +407,72 @@ def background_poller():
             if cleanup_counter >= 5:
                 cleanup_counter = 0
                 cleanup_orphaned_aria2_files()
-        except Exception as e:
-            print(f"Error in background_poller: {e}")
+                cleanup_old_hash_jobs()
+        except Exception:
+            pass
             
         time.sleep(2)
 
-
+def cleanup_old_hash_jobs():
+    now = time.time()
+    with hash_jobs_lock:
+        to_delete = [
+            path for path, job in hash_jobs.items() 
+            if job.get("status") in ["completed", "failed"] and (now - job.get("completed_at", now)) > 1800
+        ]
+        for path in to_delete:
+            del hash_jobs[path]
 
 # === Jackett Integration ===
 
 JACKETT_API_BASE = "http://127.0.0.1:9117"
 JACKETT_CONFIG_PATH = "/config/jackett/ServerConfig.json"
-
-# Cache for trending results
 _trending_cache = {}
 _trending_cache_time = {}
-TRENDING_CACHE_TTL = 21600  # 6 hours
+TRENDING_CACHE_TTL = 21600
 
 def trending_poller():
-    """Periodically pre-fetch trending data every 6 hours so it loads instantly for the user."""
-    # Initial delay to let the server start up and Jackett to be ready
     time.sleep(10)
     while True:
+        success = False
         try:
-            print("Pre-fetching trending data in background...")
             get_trending(category="movies", force_refresh=True)
             get_trending(category="tv", force_refresh=True)
             get_trending(category="games", force_refresh=True)
-            print("Trending data pre-fetched successfully.")
-        except Exception as e:
-            print(f"Error in trending_poller: {e}")
-        # Sleep for 6 hours
-        time.sleep(21600)
+            success = True
+        except Exception:
+            pass
+        time.sleep(21600 if success else 60)
+
+TRACKER_LIST_URLS = [
+    "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt",
+    "https://trackerslist.com/best_aria2.txt"
+]
+
+def tracker_updater_poller():
+    time.sleep(15)
+    while True:
+        try:
+            trackers = []
+            for url in TRACKER_LIST_URLS:
+                try:
+                    req = urllib.request.Request(url, headers={'User-Agent': 'AriaZero/1.2'})
+                    with urllib.request.urlopen(req, timeout=10) as resp:
+                        content = resp.read().decode('utf-8')
+                        lines = [line.strip() for line in content.splitlines() if line.strip() and not line.startswith('#')]
+                        if lines:
+                            trackers = lines
+                            break
+                except Exception:
+                    continue
+            if trackers:
+                trackers_str = ",".join(trackers)
+                call_aria2_rpc("aria2.changeGlobalOption", [{"bt-tracker": trackers_str}])
+        except Exception:
+            pass
+        time.sleep(86400)
 
 def get_jackett_api_key():
-    """Read the Jackett API key from its ServerConfig.json file."""
     try:
         with open(JACKETT_CONFIG_PATH, 'r') as f:
             config = json.load(f)
@@ -475,321 +481,153 @@ def get_jackett_api_key():
         return ""
 
 def search_jackett(query, categories=None, t="search"):
-    """Search torrents via Jackett's Torznab API and return parsed results."""
     api_key = get_jackett_api_key()
     if not api_key:
-        return {"error": "Jackett API key not found. Please open /jackett/ to configure.", "results": []}
-
-    params = {
-        "apikey": api_key,
-        "q": query,
-        "t": t
-    }
-    if categories:
-        params["cat"] = categories
-
+        return {"error": "Jackett API key not found", "results": []}
+    params = {"apikey": api_key, "q": query, "t": t}
+    if categories: params["cat"] = categories
     url = f"{JACKETT_API_BASE}/jackett/api/v2.0/indexers/all/results/torznab/api?{urlencode(params)}"
-
     try:
         req = urllib.request.Request(url, headers={"Accept": "application/xml"})
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=12) as resp:
             xml_data = resp.read().decode('utf-8')
         return parse_torznab_xml(xml_data)
-    except urllib.error.URLError as e:
-        return {"error": f"Jackett connection failed: {str(e)}", "results": []}
-    except Exception as e:
-        return {"error": f"Search failed: {str(e)}", "results": []}
+    except Exception:
+        return {"error": "Search failed", "results": []}
 
 def fetch_apibay_top100(category_id):
-    """Directly fetch Top 100 torrents from apibay.org for a specific category."""
     url = f"https://apibay.org/precompiled/data_top100_{category_id}.json"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
+    headers = {"User-Agent": "Mozilla/5.0"}
     try:
         req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=8) as resp:
             data = json.loads(resp.read().decode('utf-8'))
-        
         results = []
         for item in data:
             name = item.get("name", "")
-            if not name or name == "No torrents found":
-                continue
-            
             info_hash = item.get("info_hash", "")
-            if not info_hash or info_hash == "0000000000000000000000000000000000000000":
-                continue
-                
+            if not name or not info_hash: continue
             magnet = f"magnet:?xt=urn:btih:{info_hash}&dn={quote(name)}"
-            # Add some standard public trackers
-            trackers = [
-                "udp://tracker.opentrackr.org:1337/announce",
-                "udp://open.demonii.com:1337/announce",
-                "udp://open.stealth.si:80/announce",
-                "udp://tracker.torrent.eu.org:451/announce"
-            ]
-            for tr in trackers:
-                magnet += f"&tr={quote(tr)}"
-                
-            try:
-                size = int(item.get("size", 0))
-                seeders = int(item.get("seeders", 0))
-                leechers = int(item.get("leechers", 0))
-            except:
-                size = 0
-                seeders = 0
-                leechers = 0
-                
-            pub_date = ""
-            try:
-                added = int(item.get("added", 0))
-                if added:
-                    pub_date = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(added))
-            except:
-                pass
-                
-            results.append({
-                "title": name,
-                "size": size,
-                "seeders": seeders,
-                "leechers": leechers,
-                "magnetUri": magnet,
-                "infoUrl": f"https://thepiratebay.org/description.php?id={item.get('id')}",
-                "tracker": "The Pirate Bay",
-                "publishDate": pub_date,
-                "category": item.get("category", "")
-            })
+            results.append({"title": name, "size": int(item.get("size", 0)), "seeders": int(item.get("seeders", 0)), "magnetUri": magnet})
         return results
-    except Exception as e:
-        print(f"Failed to fetch apibay top 100 for category {category_id}: {e}")
+    except Exception:
         return []
 
 def get_movie_dedup_key(title):
-    """Generate a deduplication key for movies based on title and year."""
     match = re.search(r'[\s\.\(\[-](19\d{2}|20\d{2})[\s\.\)\]-]', title)
     if match:
         year = match.group(1)
-        idx = match.start()
-        title_prefix = title[:idx]
-        clean_title = re.sub(r'[^a-zA-Z0-9]', '', title_prefix).lower()
-        if clean_title:
-            return f"{clean_title}_{year}"
-            
-    # Fallback: strip common resolution and codec tags
+        return f"{re.sub(r'[^a-zA-Z0-9]', '', title[:match.start()]).lower()}_{year}"
     clean_title = re.sub(r'(1080p|720p|2160p|4k|hdrip|webrip|brrip|bluray|x264|x265|hevc|dd5|dts|h264|h265|aac).*', '', title, flags=re.IGNORECASE)
-    clean_title = re.sub(r'[^a-zA-Z0-9]', '', clean_title).lower()
-    return clean_title
+    return re.sub(r'[^a-zA-Z0-9]', '', clean_title).lower()
 
 def get_tv_dedup_key(title):
-    """Generate a deduplication key for TV shows based on title and season."""
     match = re.search(r'(?i)[\s\.\(\[-](s\d{1,2}|season\s?\d{1,2})', title)
     if match:
         season = match.group(1).lower()
-        idx = match.start()
-        title_prefix = title[:idx]
-        clean_title = re.sub(r'[^a-zA-Z0-9]', '', title_prefix).lower()
-        if clean_title:
-            return f"{clean_title}_{season}"
+        return f"{re.sub(r'[^a-zA-Z0-9]', '', title[:match.start()]).lower()}_{season}"
     return get_movie_dedup_key(title)
 
 def extract_clean_title(torrent_title, category="movies"):
-    """Extract a clean movie/TV title and year from a torrent filename.
-    
-    Examples:
-      'Obsession.2026.1080p.AMZN.WEB-DL.DDP5.1.H264.MP4-BTM' → ('Obsession', '2026')
-      'Project Hail Mary (2026) [1080p] [WEBRip] [5.1]' → ('Project Hail Mary', '2026')
-      'Rick and Morty S09E07 1080p WEB h264-EDITH' → ('Rick and Morty', None)
-      'House of the Dragon S03E03 1080p WEB h264-ETHEL' → ('House of the Dragon', None)
-    """
     title = torrent_title.strip()
     year = None
-    
-    # Try to extract year
     year_match = re.search(r'[\s\.\(\[-]((?:19|20)\d{2})[\s\.\)\]-]', title)
     if year_match:
         year = year_match.group(1)
         title = title[:year_match.start()]
-    
-    # For TV shows, cut at SxxExx or Season marker
     if category == "tv":
         tv_match = re.search(r'(?i)[\s\.\(\[-](?:s\d{1,2}|season\s?\d{1,2})', title)
-        if tv_match:
-            title = title[:tv_match.start()]
-    
-    # If no year found and no TV marker, cut at common resolution/codec tags
-    if not year and category != "tv":
+        if tv_match: title = title[:tv_match.start()]
+    elif not year:
         codec_match = re.search(r'(?i)[\s\.\(\[-](?:1080p|720p|2160p|4k|hdrip|webrip|brrip|bluray|x264|x265|hevc|web|dvdrip|hdtv)', title)
-        if codec_match:
-            title = title[:codec_match.start()]
-    
-    # Clean up: replace dots/underscores with spaces, strip junk
+        if codec_match: title = title[:codec_match.start()]
     title = re.sub(r'[\._]', ' ', title)
     title = re.sub(r'\s+', ' ', title).strip()
-    # Remove trailing dashes and group tags
     title = re.sub(r'\s*[-]\s*\w+$', '', title).strip()
-    
     return (title, year) if title else (torrent_title, None)
 
 def _get_omdb_cache_key(title, year=None, media_type='movie'):
-    """Generate a normalized cache key for OMDb lookups."""
     clean = re.sub(r'[^a-zA-Z0-9 ]', '', title).lower().strip()
-    key = f"{media_type}:{clean}"
-    if year:
-        key += f":{year}"
-    return key
+    return f"{media_type}:{clean}{f':{year}' if year else ''}"
 
 def fetch_omdb_metadata(title, year=None, media_type='movie', omdb_key=None):
-    """Query OMDb API for movie/TV metadata. Returns cached result if available.
-    
-    Returns dict with keys: genre, rtScore, plot, poster (or empty dict on failure).
-    """
     key_to_use = omdb_key or OMDB_API_KEY
-    if not key_to_use:
-        return {}
-    
+    if not key_to_use: return {}
     cache_key = _get_omdb_cache_key(title, year, media_type)
-    
-    # Check SQLite cache first
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute(
-            'SELECT genre, rt_score, plot, poster, cached_at FROM movie_metadata_cache WHERE search_key = ?',
-            (cache_key,)
-        )
+        cursor.execute('SELECT genre, rt_score, plot, poster, cached_at FROM movie_metadata_cache WHERE search_key = ?', (cache_key,))
         row = cursor.fetchone()
         conn.close()
-        
         if row and (time.time() - row['cached_at']) < OMDB_CACHE_TTL:
-            result = {}
-            if row['genre']: result['genre'] = row['genre']
-            if row['rt_score']: result['rtScore'] = row['rt_score']
-            if row['plot']: result['plot'] = row['plot']
-            if row['poster'] and row['poster'] != 'N/A': result['poster'] = row['poster']
-            return result
-    except Exception as e:
-        print(f"OMDb cache read error: {e}")
-    
-    # Query OMDb API
+            res = {}
+            if row['genre']: res['genre'] = row['genre']
+            if row['rt_score']: res['rtScore'] = row['rt_score']
+            if row['plot']: res['plot'] = row['plot']
+            if row['poster'] and row['poster'] != 'N/A': res['poster'] = row['poster']
+            return res
+    except Exception: pass
     try:
         params = {'apikey': key_to_use, 't': title, 'type': media_type, 'plot': 'short'}
-        if year:
-            params['y'] = year
-        
+        if year: params['y'] = year
         api_url = f"http://www.omdbapi.com/?{urlencode(params)}"
-        req = urllib.request.Request(api_url, headers={
-            'User-Agent': 'AriaZero/1.2'
-        })
-        with urllib.request.urlopen(req, timeout=6) as resp:
+        with urllib.request.urlopen(api_url, timeout=6) as resp:
             data = json.loads(resp.read().decode('utf-8'))
-        
-        if data.get('Response') != 'True':
-            # Try without year as fallback
-            if year:
-                params.pop('y', None)
-                api_url = f"http://www.omdbapi.com/?{urlencode(params)}"
-                req = urllib.request.Request(api_url, headers={'User-Agent': 'AriaZero/1.2'})
-                with urllib.request.urlopen(req, timeout=6) as resp:
-                    data = json.loads(resp.read().decode('utf-8'))
-            
-            if data.get('Response') != 'True':
-                # Cache the miss to avoid re-querying
-                _store_omdb_cache(cache_key, '', '', '', '')
-                return {}
-        
-        genre = data.get('Genre', '')
-        plot = data.get('Plot', '')
-        poster = data.get('Poster', '')
-        
-        # Extract Rotten Tomatoes score from Ratings array
-        rt_score = ''
-        for rating in data.get('Ratings', []):
-            if rating.get('Source') == 'Rotten Tomatoes':
-                rt_score = rating.get('Value', '')
-                break
-                
-        # Fallback to IMDb rating if Rotten Tomatoes is missing
+        if data.get('Response') != 'True': return {}
+        genre, plot, poster = data.get('Genre', ''), data.get('Plot', ''), data.get('Poster', '')
+        rt_score = next((r.get('Value') for r in data.get('Ratings', []) if r.get('Source') == 'Rotten Tomatoes'), '')
         if not rt_score:
             imdb = data.get('imdbRating', '')
-            if imdb and imdb != 'N/A':
-                rt_score = f"IMDb:{imdb}"
-        
-        # Cache the result
+            if imdb and imdb != 'N/A': rt_score = f"IMDb:{imdb}"
         _store_omdb_cache(cache_key, genre, rt_score, plot, poster)
-        
-        result = {}
-        if genre and genre != 'N/A': result['genre'] = genre
-        if rt_score: result['rtScore'] = rt_score
-        if plot and plot != 'N/A': result['plot'] = plot
-        if poster and poster != 'N/A': result['poster'] = poster
-        return result
-        
-    except Exception as e:
-        print(f"OMDb API error for '{title}': {e}")
-        return {}
+        res = {}
+        if genre and genre != 'N/A': res['genre'] = genre
+        if rt_score: res['rtScore'] = rt_score
+        if plot and plot != 'N/A': res['plot'] = plot
+        if poster and poster != 'N/A': res['poster'] = poster
+        return res
+    except Exception: return {}
 
 def _store_omdb_cache(cache_key, genre, rt_score, plot, poster):
-    """Store metadata in SQLite cache."""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute('''
-            INSERT OR REPLACE INTO movie_metadata_cache 
-            (search_key, genre, rt_score, plot, poster, cached_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (cache_key, genre, rt_score, plot, poster, int(time.time())))
+        cursor.execute('''INSERT OR REPLACE INTO movie_metadata_cache (search_key, genre, rt_score, plot, poster, cached_at) VALUES (?, ?, ?, ?, ?, ?)''', 
+                       (cache_key, genre, rt_score, plot, poster, int(time.time())))
         conn.commit()
         conn.close()
-    except Exception as e:
-        print(f"OMDb cache write error: {e}")
+    except Exception: pass
+
+_omdb_executor = ThreadPoolExecutor(max_workers=5)
 
 def enrich_trending_with_metadata(results, category, omdb_key=None):
-    """Enrich trending torrent results with movie metadata from OMDb.
-    
-    Only enriches movies and TV shows (not games).
-    Uses ThreadPoolExecutor for parallel lookups.
-    """
     key_to_use = omdb_key or OMDB_API_KEY
-    if category not in ('movies', 'tv') or not key_to_use:
-        return results
-    
+    if category not in ('movies', 'tv') or not key_to_use: return results
     media_type = 'movie' if category == 'movies' else 'series'
-    
     def enrich_single(item):
-        title = item.get('title', '')
-        
-        # Auto-detect TV episodes even in movies category (SxxExx pattern)
-        is_tv_episode = bool(re.search(r'(?i)s\d{1,2}e\d{1,2}', title))
+        title = item.get("title", "")
+        if not title: return item
+        is_tv_episode = bool(re.search(r'(?i)\bS\d{1,2}E\d{1,2}\b', title))
         actual_media_type = 'series' if is_tv_episode else media_type
         actual_category = 'tv' if is_tv_episode else category
-        
         clean_title, year = extract_clean_title(title, actual_category)
-        if not clean_title:
-            return item
-        
+        if not clean_title: return item
         metadata = fetch_omdb_metadata(clean_title, year, actual_media_type, key_to_use)
         if metadata:
             enriched = dict(item)
             enriched.update(metadata)
             return enriched
         return item
-    
-    # Run lookups in parallel (max 5 concurrent to be nice to OMDb)
     enriched_results = [None] * len(results)
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        future_to_idx = {executor.submit(enrich_single, item): idx for idx, item in enumerate(results)}
-        for future in as_completed(future_to_idx):
-            idx = future_to_idx[future]
-            try:
-                enriched_results[idx] = future.result()
-            except Exception:
-                enriched_results[idx] = results[idx]
-    
+    future_to_idx = {_omdb_executor.submit(enrich_single, item): idx for idx, item in enumerate(results)}
+    for future in as_completed(future_to_idx):
+        idx = future_to_idx[future]
+        try: enriched_results[idx] = future.result()
+        except Exception: enriched_results[idx] = results[idx]
     return enriched_results
 
 def get_trending(category="all", omdb_key=None, force_refresh=False):
-    """Get trending/top torrents. Uses cache to avoid hammering Jackett."""
     cache_key = category
     now = time.time()
 
@@ -986,6 +824,13 @@ class DiskSpaceHandler(BaseHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
         self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+
+    def _send_json(self, data, status=200):
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json')
+        self._send_cors_headers()
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode('utf-8'))
 
     def do_OPTIONS(self):
         self.send_response(200)
@@ -1189,7 +1034,7 @@ class DiskSpaceHandler(BaseHTTPRequestHandler):
                     # Normalizing path using realpath
                     real_path = os.path.realpath(path)
                     
-                    if not real_path.startswith(downloads_dir):
+                    if not (real_path.startswith(downloads_dir + os.sep) or real_path == downloads_dir):
                         errors.append(f"Forbidden path: {path}")
                         continue
                         
@@ -1315,12 +1160,8 @@ class DiskSpaceHandler(BaseHTTPRequestHandler):
                 # Security check
                 downloads_dir = os.path.realpath("/downloads")
                 real_path = os.path.realpath(file_path)
-                if not real_path.startswith(downloads_dir):
-                    self.send_response(403)
-                    self.send_header('Content-Type', 'application/json')
-                    self._send_cors_headers()
-                    self.end_headers()
-                    self.wfile.write(json.dumps({"error": "Forbidden path"}).encode('utf-8'))
+                if not (real_path.startswith(downloads_dir + os.sep) or real_path == downloads_dir):
+                    self._send_json({"error": "Forbidden path"}, status=403)
                     return
                     
                 if not os.path.exists(real_path) or os.path.isdir(real_path):
@@ -1362,6 +1203,10 @@ def run(port=8080):
     # Start the trending poller to pre-fetch data every 6 hours
     t2 = threading.Thread(target=trending_poller, daemon=True)
     t2.start()
+
+    # Start the tracker updater poller to auto-update public trackers daily
+    t3 = threading.Thread(target=tracker_updater_poller, daemon=True)
+    t3.start()
     
     server_address = ('127.0.0.1', port)
     httpd = ThreadingHTTPServer(server_address, DiskSpaceHandler)

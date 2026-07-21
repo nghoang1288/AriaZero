@@ -529,11 +529,12 @@ function AppContent({
   const getPathsToDelete = useCallback((task: Aria2Task): string[] => {
     if (!task.files || task.files.length === 0) return [];
     
+    const protectedFolders = new Set(['movies', 'tv series', 'games', 'video', 'audio', 'documents', 'software']);
+    
     const paths = task.files
       .map(f => {
         let p = f.path;
         if (!p) return '';
-        // If it's a relative path (doesn't start with /downloads/ or /), prepend /downloads/
         if (!p.startsWith('/downloads/') && !p.startsWith('/')) {
           p = `/downloads/${p}`;
         }
@@ -547,9 +548,18 @@ function AppContent({
     
     for (const path of paths) {
       const relative = path.substring('/downloads/'.length);
-      const firstPart = relative.split(/[/\\]/)[0];
-      if (firstPart) {
-        const topLevelPath = `/downloads/${firstPart}`;
+      const parts = relative.split(/[/\\]/).filter(Boolean);
+      if (parts.length === 0) continue;
+
+      const firstPartLower = parts[0].toLowerCase();
+      if (protectedFolders.has(firstPartLower)) {
+        if (parts.length >= 2) {
+          const targetPath = `/downloads/${parts[0]}/${parts[1]}`;
+          itemsToDelete.add(targetPath);
+          itemsToDelete.add(`${targetPath}.aria2`);
+        }
+      } else {
+        const topLevelPath = `/downloads/${parts[0]}`;
         itemsToDelete.add(topLevelPath);
         itemsToDelete.add(`${topLevelPath}.aria2`);
       }
@@ -761,13 +771,17 @@ function AppContent({
         const maxRetryCount = Number(localStorage.getItem('ariazero_auto_retry_count') || '3');
         const retryDelaySec = Number(localStorage.getItem('ariazero_auto_retry_delay') || '5');
 
-        const currentRetryCount = retryCountsRef.current.get(event.gid) || 0;
+        const failedTask = [...activeTasks, ...waitingTasks, ...stoppedTasks].find(t => t.gid === event.gid);
+        const retryKey = failedTask 
+          ? (failedTask.files?.[0]?.uris?.[0]?.uri || failedTask.bittorrent?.info?.name || getTaskName(failedTask))
+          : event.gid;
+
+        const currentRetryCount = retryCountsRef.current.get(retryKey) || 0;
 
         if (autoRetryEnabled && currentRetryCount < maxRetryCount) {
-          const failedTask = [...activeTasks, ...waitingTasks, ...stoppedTasks].find(t => t.gid === event.gid);
           if (failedTask) {
             const nextRetry = currentRetryCount + 1;
-            retryCountsRef.current.set(event.gid, nextRetry);
+            retryCountsRef.current.set(retryKey, nextRetry);
             
             showToast({
               type: 'info',
@@ -792,7 +806,6 @@ function AppContent({
             });
           }
         } else {
-          const failedTask = [...activeTasks, ...waitingTasks, ...stoppedTasks].find(t => t.gid === event.gid);
           const taskName = failedTask ? getTaskName(failedTask) : event.gid;
           showToast({
             type: 'error',
@@ -1216,7 +1229,7 @@ function AppContent({
 
           {activeTab === 'search' && (
             <SearchTorrentsPage
-              addUri={addUriWithCategory}
+              addUri={addUri}
               showToast={showToast}
             />
           )}
