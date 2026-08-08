@@ -75,7 +75,7 @@ export default function DownloadsPage({
   }, [stoppedTasks, lowercaseQuery]);
 
   const downloads = useMemo(() => {
-    return displayDownloads.filter((t: Aria2Task) => !isTorrentCompleted(t) && !isMetadataTask(t));
+    return displayDownloads.filter((t: Aria2Task) => !isTorrentCompleted(t));
   }, [displayDownloads]);
 
   const completedAndStopped = useMemo(() => {

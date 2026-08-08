@@ -130,13 +130,7 @@ function App() {
         let subfolder = '';
         
         if (category === 'video' || filename.match(/\.(mkv|mp4|avi|mov|wmv|flv|webm)$/i)) {
-          // Detect if it's a TV Series based on naming pattern
-          const tvPattern = /\bS\d{1,2}E\d{1,2}\b|\bSeason\s*\d+\b/i;
-          if (tvPattern.test(filename)) {
-            subfolder = 'TV Series';
-          } else {
-            subfolder = 'Movies';
-          }
+          subfolder = 'Movies';
         }
         else if (category === 'audio') subfolder = localStorage.getItem('ariazero_audio_folder') || 'Audio';
         else if (category === 'documents') subfolder = localStorage.getItem('ariazero_doc_folder') || 'Documents';
@@ -1242,7 +1236,7 @@ function AppContent({
             <span className="flex items-center gap-1.5 font-semibold text-text-main">
               AriaZero
               <span className="text-[10px] bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 px-1.5 py-0.5 rounded font-mono font-bold">
-                v1.2.0
+                v1.3.0
               </span>
             </span>
             <span className="hidden lg:inline text-[10px] text-text-dim/60 font-mono">Real-time Graphs • Task details drawer • Bandwidth scheduler</span>

@@ -60,6 +60,12 @@ def init_db():
                 cached_at INTEGER
             )
         ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS system_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        ''')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_dh_completed_time ON download_history(completed_time DESC)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_dh_name ON download_history(name)')
         conn.commit()
@@ -257,6 +263,10 @@ def upsert_history_records(tasks):
             files_json = json.dumps(task.get('files', []))
             bittorrent_json = json.dumps(task.get('bittorrent', {}))
             
+            cursor.execute('SELECT status FROM download_history WHERE gid = ?', (gid,))
+            row = cursor.fetchone()
+            old_status = row['status'] if row else None
+
             cursor.execute('''
                 INSERT INTO download_history (
                     gid, name, total_length, completed_length, status,
@@ -272,9 +282,43 @@ def upsert_history_records(tasks):
                     files_json=excluded.files_json,
                     bittorrent_json=excluded.bittorrent_json
             ''', (gid, name, total_length, completed_length, status, error_code, error_message, now, files_json, bittorrent_json))
+            
+            # Check if newly completed
+            if status == 'complete' and old_status != 'complete':
+                threading.Thread(target=trigger_jellyfin_refresh, daemon=True).start()
+
         conn.commit()
     finally:
         conn.close()
+
+def get_all_system_settings():
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute('SELECT key, value FROM system_settings')
+        return {r["key"]: r["value"] for r in cursor.fetchall()}
+    finally:
+        conn.close()
+
+def trigger_jellyfin_refresh():
+    settings = get_all_system_settings()
+    url = settings.get("jellyfin_url", "").strip()
+    api_key = settings.get("jellyfin_api_key", "").strip()
+    if not url or not api_key:
+        return
+    
+    url = url.rstrip('/')
+    endpoint = f"{url}/Library/Refresh"
+    
+    try:
+        req = urllib.request.Request(endpoint, method="POST", headers={
+            "X-Emby-Token": api_key,
+            "Content-Type": "application/json"
+        })
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            print(f"Jellyfin library refresh triggered successfully (status: {resp.getcode()})")
+    except Exception as e:
+        print(f"Failed to trigger Jellyfin refresh at {endpoint}: {e}")
 
 def calculate_sha256_thread(file_path):
     try:
@@ -885,6 +929,22 @@ class DiskSpaceHandler(BaseHTTPRequestHandler):
                 self._send_cors_headers()
                 self.end_headers()
                 self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
+        elif self.path == '/api/settings':
+            if not self.check_auth():
+                return
+            try:
+                settings = get_all_system_settings()
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self._send_cors_headers()
+                self.end_headers()
+                self.wfile.write(json.dumps(settings).encode('utf-8'))
+            except Exception as e:
+                self.send_response(500)
+                self.send_header('Content-Type', 'application/json')
+                self._send_cors_headers()
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
         elif self.path == '/api/history':
             if not self.check_auth():
                 return
@@ -996,7 +1056,43 @@ class DiskSpaceHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def do_POST(self):
-        if self.path == '/api/delete-files':
+        if self.path == '/api/settings':
+            if not self.check_auth():
+                return
+            try:
+                content_length_str = self.headers.get('Content-Length')
+                content_length = int(content_length_str) if content_length_str else 0
+                if content_length > 1048576:
+                    self.send_response(413)
+                    self.send_header('Content-Type', 'application/json')
+                    self._send_cors_headers()
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": "Payload too large"}).encode('utf-8'))
+                    return
+                
+                post_data = self.rfile.read(content_length)
+                req_data = json.loads(post_data.decode('utf-8'))
+                
+                conn = get_db_connection()
+                try:
+                    cursor = conn.cursor()
+                    for k, v in req_data.items():
+                        cursor.execute('INSERT INTO system_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', (k, str(v)))
+                    conn.commit()
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self._send_cors_headers()
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"success": True}).encode('utf-8'))
+                finally:
+                    conn.close()
+            except Exception as e:
+                self.send_response(500)
+                self.send_header('Content-Type', 'application/json')
+                self._send_cors_headers()
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
+        elif self.path == '/api/delete-files':
             if not self.check_auth():
                 return
             try:

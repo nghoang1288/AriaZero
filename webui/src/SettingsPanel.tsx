@@ -13,6 +13,7 @@ import {
   Link,
 } from 'lucide-react';
 import { useToast } from './Toast';
+import { useApiUrl } from './hooks/useApiUrl';
 
 
 // ---------------------------------------------------------------------------
@@ -545,6 +546,9 @@ export default function SettingsPanel({
           onUpdate={handleUpdate}
         />
       ))}
+
+      {/* Integrations */}
+      <IntegrationsSection />
     </div>
   );
 }
@@ -1103,3 +1107,120 @@ function AriaZeroFeaturesSection() {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Integrations Section
+// ---------------------------------------------------------------------------
+function IntegrationsSection() {
+  const [expanded, setExpanded] = useState(false);
+  const [jellyfinUrl, setJellyfinUrl] = useState('');
+  const [jellyfinApiKey, setJellyfinApiKey] = useState('');
+  const [saving, setSaving] = useState(false);
+  const { getApiUrl } = useApiUrl();
+  const { showToast } = useToast();
+
+  // Load from backend
+  useEffect(() => {
+    fetch(`${getApiUrl('settings')}`)
+      .then(res => res.json())
+      .then(data => {
+        if (data && typeof data === 'object') {
+          if (data.jellyfin_url) setJellyfinUrl(data.jellyfin_url);
+          if (data.jellyfin_api_key) setJellyfinApiKey(data.jellyfin_api_key);
+        }
+      })
+      .catch(err => console.error("Failed to load settings", err));
+  }, [getApiUrl]);
+
+  const handleSave = async () => {
+    setSaving(true);
+    try {
+      const resp = await fetch(`${getApiUrl('settings')}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jellyfin_url: jellyfinUrl,
+          jellyfin_api_key: jellyfinApiKey
+        })
+      });
+      if (resp.ok) {
+        showToast({ title: 'Saved', message: 'Integration settings saved to server.', type: 'success' });
+      } else {
+        throw new Error("Server returned " + resp.status);
+      }
+    } catch (e: any) {
+      showToast({ title: 'Error', message: e.message || 'Failed to save', type: 'error' });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="bg-card-bg border border-border-main rounded-xl overflow-hidden mb-6">
+      <button
+        type="button"
+        onClick={() => setExpanded((p) => !p)}
+        className="w-full flex items-center justify-between px-5 py-4 text-left group hover:bg-slate-800/20 transition-colors"
+      >
+        <div className="flex items-center gap-2.5">
+          <div className="bg-cyan-500/10 p-1.5 rounded-lg border border-cyan-500/20 text-cyan-400">
+            <Link className="w-4 h-4" />
+          </div>
+          <h2 className="text-sm font-semibold text-slate-200">Integrations</h2>
+        </div>
+        <ChevronDown
+          className={`w-4 h-4 text-slate-500 transition-transform duration-200 ${expanded ? 'rotate-0' : '-rotate-90'}`}
+        />
+      </button>
+
+      {expanded && (
+        <div className="border-t border-border-main divide-y divide-border-main">
+          <div className="px-5 py-2.5 bg-slate-800/20 border-b border-border-main">
+            <span className="text-xs font-semibold text-cyan-400 uppercase tracking-wider">Jellyfin Auto-Refresh</span>
+          </div>
+
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 px-5 py-3.5 hover:bg-slate-800/10 transition-colors">
+            <div className="sm:max-w-[55%]">
+              <span className="text-xs font-semibold text-slate-200 block">Jellyfin URL</span>
+              <span className="text-[10px] text-slate-500">e.g., http://192.168.50.226:8096</span>
+            </div>
+            <div className="w-full sm:w-64">
+              <input
+                type="text"
+                placeholder="http://192.168.50.226:8096"
+                value={jellyfinUrl}
+                onChange={(e) => setJellyfinUrl(e.target.value)}
+                className="w-full bg-input-bg border border-border-main rounded-lg px-3 py-2 text-xs text-slate-300 focus:outline-none focus:border-cyan-500/70"
+              />
+            </div>
+          </div>
+
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 px-5 py-3.5 hover:bg-slate-800/10 transition-colors">
+            <div className="sm:max-w-[55%]">
+              <span className="text-xs font-semibold text-slate-200 block">Jellyfin API Key</span>
+              <span className="text-[10px] text-slate-500">Generate this in Jellyfin Dashboard &rarr; Advanced &rarr; API Keys</span>
+            </div>
+            <div className="w-full sm:w-64">
+              <input
+                type="password"
+                placeholder="API Key..."
+                value={jellyfinApiKey}
+                onChange={(e) => setJellyfinApiKey(e.target.value)}
+                className="w-full bg-input-bg border border-border-main rounded-lg px-3 py-2 text-xs text-slate-300 focus:outline-none focus:border-cyan-500/70"
+              />
+            </div>
+          </div>
+
+          <div className="px-5 py-3.5 flex justify-end">
+            <button
+              onClick={handleSave}
+              disabled={saving}
+              className="bg-cyan-500 hover:bg-cyan-600 text-white font-medium text-xs px-4 py-2 rounded-lg shadow-lg shadow-cyan-500/20 transition-all disabled:opacity-50"
+            >
+              {saving ? 'Saving...' : 'Save Settings'}
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

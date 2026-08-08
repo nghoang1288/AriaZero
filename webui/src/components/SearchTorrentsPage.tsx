@@ -205,7 +205,7 @@ export default function SearchTorrentsPage({ addUri, showToast }: SearchTorrents
     if (category === 'Popular Movies') {
       options.dir = '/downloads/Movies';
     } else if (category === 'TV Series') {
-      options.dir = '/downloads/TV Series';
+      options.dir = '/downloads/Movies';
     } else if (category === 'Trending Games') {
       options.dir = '/downloads/Games';
     }
