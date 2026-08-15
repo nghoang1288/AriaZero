@@ -202,15 +202,18 @@ export default function SearchTorrentsPage({ addUri, showToast }: SearchTorrents
     }
     
     const options: Record<string, string> = {};
-    if (category === 'Popular Movies') {
-      options.dir = '/downloads/Movies';
-    } else if (category === 'TV Series') {
-      options.dir = '/downloads/Movies';
-    } else if (category === 'Trending Games') {
+    const isGame = category === 'Trending Games' || 
+      activeCategory === 'games' || 
+      /\b(repack|fitgirl|dodi|codex|skidrow|flt|rune|tenoke|gog)\b/i.test(title);
+
+    if (isGame) {
       options.dir = '/downloads/Games';
+    } else {
+      // Per user request, all Movies, TV Series, and video torrents route directly to /downloads/Movies
+      options.dir = '/downloads/Movies';
     }
     
-    addUri(magnetUri, Object.keys(options).length > 0 ? options : undefined);
+    addUri(magnetUri, options);
     showToast({ title: 'Download Started', message: `Downloading: ${title.slice(0, 40)}...`, type: 'success' });
   };
 
@@ -405,7 +408,7 @@ export default function SearchTorrentsPage({ addUri, showToast }: SearchTorrents
                       </td>
                       <td className="p-4 text-center">
                         <button
-                          onClick={() => handleDownload(item.magnetUri, item.title, getCategoryNameForDownload())}
+                          onClick={() => handleDownload(item.magnetUri, item.title, item.category || getCategoryNameForDownload())}
                           disabled={!item.magnetUri}
                           title={item.magnetUri ? "Download Torrent" : "Download URL not found"}
                           className="p-2 rounded-lg bg-cyan-500/10 hover:bg-cyan-500 text-cyan-400 hover:text-black border border-cyan-500/20 hover:border-transparent transition-all cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed"

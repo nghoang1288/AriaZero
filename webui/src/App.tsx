@@ -35,6 +35,7 @@ import {
   isTorrent, 
   isAudio, 
   isVideo, 
+  isVideoName,
   isDoc, 
   isSoftware, 
   isMetadataTask,
@@ -104,10 +105,10 @@ function App() {
   const addUriWithCategory = useCallback((uri: string, options?: Record<string, string>) => {
     const sanitizedUri = sanitizeMagnetLink(uri);
     const autoCategorizeEnabled = localStorage.getItem('ariazero_auto_categorize_enabled') !== 'false';
-    const baseDir = globalOptionsRef.current.dir || '';
+    const baseDir = globalOptionsRef.current.dir || '/downloads';
 
     let mergedOptions = { ...options };
-    if (autoCategorizeEnabled && baseDir) {
+    if (!mergedOptions.dir && autoCategorizeEnabled && baseDir) {
       let filename = '';
       if (sanitizedUri.startsWith('magnet:')) {
         const match = sanitizedUri.match(/[?&]dn=([^&]+)/);
@@ -129,20 +130,20 @@ function App() {
         const category = getFileCategory(filename);
         let subfolder = '';
         
-        if (category === 'video' || filename.match(/\.(mkv|mp4|avi|mov|wmv|flv|webm)$/i)) {
+        if (category === 'video' || isVideoName(filename)) {
           subfolder = 'Movies';
         }
         else if (category === 'audio') subfolder = localStorage.getItem('ariazero_audio_folder') || 'Audio';
         else if (category === 'documents') subfolder = localStorage.getItem('ariazero_doc_folder') || 'Documents';
         else if (category === 'software') subfolder = localStorage.getItem('ariazero_software_folder') || 'Software';
 
-        if (subfolder && !mergedOptions.dir) {
+        if (subfolder) {
           const cleanBaseDir = baseDir.replace(/[/\\]$/, '');
           mergedOptions.dir = `${cleanBaseDir}/${subfolder}`;
         }
       }
     }
-    return addUri(sanitizedUri, mergedOptions);
+    return addUri(sanitizedUri, Object.keys(mergedOptions).length > 0 ? mergedOptions : undefined);
   }, [addUri]);
 
   // Smart download handler: when a link is detected from clipboard/magnet/drag

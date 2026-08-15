@@ -72,9 +72,20 @@ export const isMetadataTask = (task: Aria2Task) => {
          (hasBt && !task.bittorrent?.info);
 };
 
+export function isVideoName(filename: string): boolean {
+  if (!filename) return false;
+  const lower = filename.toLowerCase();
+  // Check extensions anywhere in filename (e.g. .mkv.aria2, title.mkv[EZTV], etc.)
+  if (/\.(mkv|mp4|avi|mov|flv|wmv|webm|ts|m4v|iso|vob|m2ts)(\b|\[|\.|\s|_|-|$)/i.test(lower)) return true;
+  // Check typical scene release / media tags (e.g. 1080p, 720p, 2160p, 4k, bluray, web-dl, s01e02, hevc, etc.)
+  if (/(1080p|720p|2160p|4k|uhd|web-?dl|webrip|bluray|bdrip|hdrip|dvdrip|h\.?264|x\.?264|h\.?265|x\.?265|hevc|ddp\d?\.?\d?|dts|remux|s\d{1,2}e\d{1,2}|season\s*\d+|\be\d{1,2}\b)/i.test(lower)) return true;
+  return false;
+}
+
 export function filterTaskByCategory(task: Aria2Task, category: string): boolean {
   if (isMetadataTask(task)) return false;
-  const ext = getFileExtension(getTaskName(task));
+  const name = getTaskName(task);
+  const ext = getFileExtension(name);
   switch (category) {
     case 'active':
       return (task.status === 'active' || task.status === 'waiting') && !isTorrentCompleted(task);
@@ -85,7 +96,7 @@ export function filterTaskByCategory(task: Aria2Task, category: string): boolean
     case 'torrents':
       return isTorrent(task);
     case 'video':
-      return isVideo(ext);
+      return isVideo(ext) || isVideoName(name);
     case 'audio':
       return isAudio(ext);
     case 'documents':
@@ -99,6 +110,7 @@ export function filterTaskByCategory(task: Aria2Task, category: string): boolean
 }
 
 export function getFileCategory(filename: string): 'video' | 'audio' | 'documents' | 'software' | 'other' {
+  if (isVideoName(filename)) return 'video';
   const ext = getFileExtension(filename);
   if (isVideo(ext)) return 'video';
   if (isAudio(ext)) return 'audio';
