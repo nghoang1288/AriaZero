@@ -66,6 +66,12 @@ def init_db():
                 value TEXT
             )
         ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS dismissed_history (
+                gid TEXT PRIMARY KEY,
+                name TEXT
+            )
+        ''')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_dh_completed_time ON download_history(completed_time DESC)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_dh_name ON download_history(name)')
         # Clean up any leftover metadata items from history
@@ -74,14 +80,14 @@ def init_db():
     finally:
         conn.close()
     
-    # Automatically scan existing downloaded files on disk and populate history
+    # Automatically scan existing downloaded files on disk once if needed
     try:
         sync_existing_files_to_history()
     except Exception as e:
         print(f"Error running initial sync_existing_files_to_history: {e}")
 
 def sync_existing_files_to_history():
-    """Scans download directories on disk and automatically adds any completed files to download_history if not already present."""
+    """Scans download directories on disk and automatically adds any completed files to download_history if not already present or dismissed."""
     base_dir = "/downloads"
     if not os.path.exists(base_dir):
         return
@@ -91,6 +97,10 @@ def sync_existing_files_to_history():
         cursor = conn.cursor()
         cursor.execute("SELECT name FROM download_history")
         existing_names = {r["name"] for r in cursor.fetchall()}
+        cursor.execute("SELECT name, gid FROM dismissed_history")
+        dismissed_rows = cursor.fetchall()
+        dismissed_names = {r["name"] for r in dismissed_rows if r["name"]}
+        dismissed_gids = {r["gid"] for r in dismissed_rows if r["gid"]}
         
         media_exts = {
             '.mp4', '.mkv', '.avi', '.mov', '.flv', '.wmv', '.webm', '.ts', '.m4v',
@@ -114,8 +124,9 @@ def sync_existing_files_to_history():
                     continue
                 
                 rel_path = os.path.relpath(full_path, base_dir)
+                gid = hashlib.md5(rel_path.encode('utf-8')).hexdigest()[:16]
                 
-                if file in existing_names:
+                if file in existing_names or file in dismissed_names or gid in dismissed_gids:
                     continue
                 
                 try:
@@ -124,7 +135,6 @@ def sync_existing_files_to_history():
                     if file_size < 1024 * 1024:  # Ignore tiny files (<1MB)
                         continue
                     mtime = int(stat.st_mtime)
-                    gid = hashlib.md5(rel_path.encode('utf-8')).hexdigest()[:16]
                     
                     files_json = json.dumps([{
                         "index": "1",
@@ -236,14 +246,11 @@ def delete_history_record(gid):
     # Try forceRemove first (handles active/waiting/paused tasks)
     result = call_aria2_rpc("aria2.forceRemove", [gid])
     if result and "result" in result:
-        # forceRemove succeeded - task is transitioning to stopped state.
-        # Wait briefly for aria2 to fully transition the task.
         time.sleep(0.3)
     
     # Remove from stopped list (handles complete/error/removed tasks)
     result = call_aria2_rpc("aria2.removeDownloadResult", [gid])
     if result is None or "error" in str(result):
-        # Retry after a short delay in case the task hasn't fully transitioned
         time.sleep(0.3)
         call_aria2_rpc("aria2.removeDownloadResult", [gid])
     
@@ -253,6 +260,10 @@ def delete_history_record(gid):
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
+        cursor.execute('SELECT name FROM download_history WHERE gid = ?', (gid,))
+        row = cursor.fetchone()
+        task_name = row['name'] if row else ''
+        cursor.execute('INSERT OR IGNORE INTO dismissed_history (gid, name) VALUES (?, ?)', (gid, task_name))
         cursor.execute('DELETE FROM download_history WHERE gid = ?', (gid,))
         conn.commit()
         call_aria2_rpc("aria2.saveSession", [])
@@ -261,14 +272,17 @@ def delete_history_record(gid):
         conn.close()
 
 def clear_history():
-    # Add all existing history GIDs to blocklist
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
-        cursor.execute('SELECT gid FROM download_history')
+        cursor.execute('SELECT gid, name FROM download_history')
+        rows = cursor.fetchall()
         with _deleted_gids_lock:
-            for r in cursor.fetchall():
+            for r in rows:
                 _deleted_gids.add(r["gid"])
+                cursor.execute('INSERT OR IGNORE INTO dismissed_history (gid, name) VALUES (?, ?)', (r["gid"], r["name"]))
+        cursor.execute('DELETE FROM download_history')
+        conn.commit()
     finally:
         conn.close()
 
@@ -277,14 +291,6 @@ def clear_history():
     
     # Force save the session file immediately
     call_aria2_rpc("aria2.saveSession", [])
-
-    conn = get_db_connection()
-    try:
-        cursor = conn.cursor()
-        cursor.execute('DELETE FROM download_history')
-        conn.commit()
-    finally:
-        conn.close()
 
 def get_task_name(task):
     bt = task.get('bittorrent', {})
@@ -324,6 +330,11 @@ def upsert_history_records(tasks):
             with _deleted_gids_lock:
                 if gid in _deleted_gids:
                     continue
+            cursor.execute('SELECT 1 FROM dismissed_history WHERE gid = ?', (gid,))
+            if cursor.fetchone():
+                with _deleted_gids_lock:
+                    _deleted_gids.add(gid)
+                continue
             name = get_task_name(task)
             # Skip metadata tasks from polluting history
             if name.lower().startswith('[metadata]') or name.lower().startswith('metadata'):
@@ -555,11 +566,6 @@ def background_poller():
                 cleanup_counter = 0
                 cleanup_orphaned_aria2_files()
                 cleanup_old_hash_jobs()
-                
-            sync_counter += 1
-            if sync_counter >= 15:  # Sync disk files every 30s
-                sync_counter = 0
-                sync_existing_files_to_history()
         except Exception:
             pass
             
