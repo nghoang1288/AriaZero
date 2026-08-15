@@ -68,7 +68,85 @@ def init_db():
         ''')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_dh_completed_time ON download_history(completed_time DESC)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_dh_name ON download_history(name)')
+        # Clean up any leftover metadata items from history
+        cursor.execute("DELETE FROM download_history WHERE name LIKE '[METADATA]%' OR name LIKE 'metadata%'")
         conn.commit()
+    finally:
+        conn.close()
+    
+    # Automatically scan existing downloaded files on disk and populate history
+    try:
+        sync_existing_files_to_history()
+    except Exception as e:
+        print(f"Error running initial sync_existing_files_to_history: {e}")
+
+def sync_existing_files_to_history():
+    """Scans download directories on disk and automatically adds any completed files to download_history if not already present."""
+    base_dir = "/downloads"
+    if not os.path.exists(base_dir):
+        return
+    
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM download_history")
+        existing_names = {r["name"] for r in cursor.fetchall()}
+        
+        media_exts = {
+            '.mp4', '.mkv', '.avi', '.mov', '.flv', '.wmv', '.webm', '.ts', '.m4v',
+            '.iso', '.apk', '.zip', '.rar', '.7z', '.mp3', '.flac', '.wav', '.m4a'
+        }
+        
+        # Scan root /downloads and subdirectories (e.g. /downloads/Movies, /downloads/Games, etc.)
+        for root, dirs, files in os.walk(base_dir):
+            for file in files:
+                if file.startswith('.'):
+                    continue
+                ext = os.path.splitext(file)[1].lower()
+                if ext not in media_exts:
+                    continue
+                if file.endswith('.aria2'):
+                    continue
+                
+                full_path = os.path.join(root, file)
+                # Check if there is an active .aria2 file indicating it is currently downloading
+                if os.path.exists(f"{full_path}.aria2"):
+                    continue
+                
+                rel_path = os.path.relpath(full_path, base_dir)
+                
+                if file in existing_names:
+                    continue
+                
+                try:
+                    stat = os.stat(full_path)
+                    file_size = stat.st_size
+                    if file_size < 1024 * 1024:  # Ignore tiny files (<1MB)
+                        continue
+                    mtime = int(stat.st_mtime)
+                    gid = hashlib.md5(rel_path.encode('utf-8')).hexdigest()[:16]
+                    
+                    files_json = json.dumps([{
+                        "index": "1",
+                        "path": full_path,
+                        "length": str(file_size),
+                        "completedLength": str(file_size),
+                        "selected": "true",
+                        "uris": []
+                    }])
+                    
+                    cursor.execute('''
+                        INSERT OR IGNORE INTO download_history (
+                            gid, name, total_length, completed_length, status,
+                            error_code, error_message, completed_time, files_json, bittorrent_json
+                        ) VALUES (?, ?, ?, ?, 'complete', '', '', ?, ?, '{}')
+                    ''', (gid, file, file_size, file_size, mtime, files_json))
+                    existing_names.add(file)
+                except Exception as e:
+                    print(f"Error indexing file {full_path}: {e}")
+        conn.commit()
+    except Exception as e:
+        print(f"Error in sync_existing_files_to_history: {e}")
     finally:
         conn.close()
 
@@ -247,6 +325,9 @@ def upsert_history_records(tasks):
                 if gid in _deleted_gids:
                     continue
             name = get_task_name(task)
+            # Skip metadata tasks from polluting history
+            if name.lower().startswith('[metadata]') or name.lower().startswith('metadata'):
+                continue
             
             try:
                 total_length = int(task.get('totalLength', 0))
@@ -258,6 +339,13 @@ def upsert_history_records(tasks):
                 completed_length = 0
                 
             status = task.get('status')
+            # If a task finished downloading (even if it is currently active / seeding), mark status as complete
+            if total_length > 0 and completed_length >= total_length:
+                status = 'complete'
+            elif status not in ('complete', 'error', 'removed'):
+                # For non-stopped/incomplete tasks, do not add to persistent history unless complete
+                continue
+                
             error_code = task.get('errorCode')
             error_message = task.get('errorMessage')
             files_json = json.dumps(task.get('files', []))
@@ -424,15 +512,30 @@ def cleanup_orphaned_aria2_files():
 
 def background_poller():
     cleanup_counter = 0
+    sync_counter = 0
     while True:
         try:
             secret = os.environ.get('ARIA2_RPC_SECRET')
-            rpc_payload = {
-                "jsonrpc": "2.0",
-                "id": "ariazero_history_poller",
-                "method": "aria2.tellStopped",
-                "params": [f"token:{secret}", 0, 1000] if secret else [0, 1000]
-            }
+            rpc_payload = [
+                {
+                    "jsonrpc": "2.0",
+                    "id": "poller_stopped",
+                    "method": "aria2.tellStopped",
+                    "params": [f"token:{secret}", 0, 1000] if secret else [0, 1000]
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "id": "poller_active",
+                    "method": "aria2.tellActive",
+                    "params": [f"token:{secret}"] if secret else []
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "id": "poller_waiting",
+                    "method": "aria2.tellWaiting",
+                    "params": [f"token:{secret}", 0, 1000] if secret else [0, 1000]
+                }
+            ]
             aria2_port = os.environ.get('ARIA2_RPC_PORT', '6800')
             url = f"http://127.0.0.1:{aria2_port}/jsonrpc"
             
@@ -442,16 +545,21 @@ def background_poller():
             
             with urllib.request.urlopen(req, timeout=5) as response:
                 resp_data = json.loads(response.read().decode('utf-8'))
-                if "result" in resp_data:
-                    tasks = resp_data["result"]
-                    if isinstance(tasks, list):
-                        upsert_history_records(tasks)
-                        
+                if isinstance(resp_data, list):
+                    for item in resp_data:
+                        if "result" in item and isinstance(item["result"], list):
+                            upsert_history_records(item["result"])
+                            
             cleanup_counter += 1
             if cleanup_counter >= 5:
                 cleanup_counter = 0
                 cleanup_orphaned_aria2_files()
                 cleanup_old_hash_jobs()
+                
+            sync_counter += 1
+            if sync_counter >= 15:  # Sync disk files every 30s
+                sync_counter = 0
+                sync_existing_files_to_history()
         except Exception:
             pass
             
