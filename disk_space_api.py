@@ -887,6 +887,7 @@ def parse_torznab_xml(xml_data):
             seeders = 0
             leechers = 0
             magnet_uri = ""
+            torrent_url = ""
             info_url = ""
             tracker = ""
             pub_date = ""
@@ -923,10 +924,18 @@ def parse_torznab_xml(xml_data):
                     tracker = value
 
             enclosure = item.find('enclosure')
-            if enclosure is not None and not magnet_uri:
+            if enclosure is not None:
                 enc_url = enclosure.get('url', '')
-                if enc_url.startswith('magnet:'):
+                if not magnet_uri and enc_url.startswith('magnet:'):
                     magnet_uri = enc_url
+                elif not magnet_uri and enc_url:
+                    # Jackett proxy download URL for .torrent file
+                    torrent_url = enc_url
+
+            # Also check <link> for Jackett proxy download URL
+            link_url = item.findtext('link', '')
+            if not magnet_uri and not torrent_url and link_url and '/jackett/' in link_url:
+                torrent_url = link_url
 
             info_url = item.findtext('comments', '') or item.findtext('link', '')
 
@@ -937,7 +946,7 @@ def parse_torznab_xml(xml_data):
                 tracker = "Unknown"
 
             if title:
-                results.append({
+                result_item = {
                     "title": title,
                     "size": size,
                     "seeders": seeders,
@@ -947,7 +956,10 @@ def parse_torznab_xml(xml_data):
                     "tracker": tracker,
                     "publishDate": pub_date,
                     "category": category
-                })
+                }
+                if torrent_url and not magnet_uri:
+                    result_item["torrentUrl"] = torrent_url
+                results.append(result_item)
 
     except ET.ParseError as e:
         return {"error": f"Failed to parse Jackett response: {str(e)}", "results": []}
@@ -974,6 +986,38 @@ def get_jackett_status():
                 return {"running": False, "message": f"Jackett returned status code: {resp.getcode()}"}
     except Exception as e:
         return {"running": False, "message": f"Cannot connect to Jackett: {str(e)}"}
+
+class MagnetRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if newurl.startswith('magnet:'):
+            raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+def resolve_jackett_torrent_link(url):
+    """Resolve a Jackett download proxy URL to either a magnetUri or base64 torrent file content."""
+    if not url:
+        return {"error": "Missing URL"}
+    try:
+        opener = urllib.request.build_opener(MagnetRedirectHandler)
+        try:
+            req = urllib.request.Request(url)
+            with opener.open(req, timeout=15) as resp:
+                content = resp.read()
+                text_start = content[:500].decode('utf-8', errors='ignore')
+                if text_start.startswith('magnet:'):
+                    return {"magnetUri": text_start.strip()}
+                
+                import base64
+                b64 = base64.b64encode(content).decode('utf-8')
+                return {"base64": b64}
+        except urllib.error.HTTPError as e:
+            if e.code in (301, 302, 303, 307, 308):
+                location = e.headers.get('Location', '')
+                if location.startswith('magnet:'):
+                    return {"magnetUri": location}
+            return {"error": f"HTTP Error {e.code}: {e.reason}"}
+    except Exception as e:
+        return {"error": f"Failed to resolve torrent link: {str(e)}"}
 
 
 
@@ -1137,6 +1181,28 @@ class DiskSpaceHandler(BaseHTTPRequestHandler):
                 cat = query_params.get('cat', ['all'])[0]
                 omdb_key = self.headers.get('X-OMDb-API-Key') or self.headers.get('x-omdb-api-key') or OMDB_API_KEY
                 result = get_trending(cat, omdb_key)
+
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self._send_cors_headers()
+                self.end_headers()
+                self.wfile.write(json.dumps(result).encode('utf-8'))
+            except Exception as e:
+                self.send_response(500)
+                self.send_header('Content-Type', 'application/json')
+                self._send_cors_headers()
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
+        elif self.path.startswith('/api/resolve-torrent'):
+            if not self.check_auth():
+                return
+            try:
+                query_params = parse_qs(urlparse(self.path).query)
+                target_url = query_params.get('url', [''])[0]
+                if not target_url:
+                    result = {"error": "Missing 'url' query parameter"}
+                else:
+                    result = resolve_jackett_torrent_link(target_url)
 
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json')

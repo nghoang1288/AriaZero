@@ -6,6 +6,7 @@ import type { ToastMessage } from '../Toast';
 
 interface SearchTorrentsPageProps {
   addUri: (uri: string, options?: Record<string, string>) => void;
+  addTorrent?: (base64: string) => void;
   showToast: (toast: Omit<ToastMessage, 'id'>) => void;
 }
 
@@ -15,6 +16,7 @@ interface TorrentResult {
   seeders: number;
   leechers: number;
   magnetUri: string;
+  torrentUrl?: string;
   infoUrl: string;
   tracker: string;
   publishDate: string;
@@ -33,7 +35,7 @@ interface JackettStatus {
   totalIndexers?: number;
 }
 
-export default function SearchTorrentsPage({ addUri, showToast }: SearchTorrentsPageProps) {
+export default function SearchTorrentsPage({ addUri, addTorrent, showToast }: SearchTorrentsPageProps) {
   const { getApiUrl } = useApiUrl();
   const [query, setQuery] = useState('');
   const [activeCategory, setActiveCategory] = useState<string>('all');
@@ -195,12 +197,7 @@ export default function SearchTorrentsPage({ addUri, showToast }: SearchTorrents
   };
 
   // Trigger download helper
-  const handleDownload = (magnetUri: string, title: string, category?: string) => {
-    if (!magnetUri) {
-      showToast({ title: 'Download Error', message: 'No download link (magnet URI) found for this torrent', type: 'error' });
-      return;
-    }
-    
+  const handleDownload = async (magnetUri: string, title: string, category?: string, torrentUrl?: string) => {
     const options: Record<string, string> = {};
     const isGame = category === 'Trending Games' || 
       activeCategory === 'games' || 
@@ -212,9 +209,39 @@ export default function SearchTorrentsPage({ addUri, showToast }: SearchTorrents
       // Per user request, all Movies, TV Series, and video torrents route directly to /downloads/Movies
       options.dir = '/downloads/Movies';
     }
-    
-    addUri(magnetUri, options);
-    showToast({ title: 'Download Started', message: `Downloading: ${title.slice(0, 40)}...`, type: 'success' });
+
+    if (magnetUri) {
+      addUri(magnetUri, options);
+      showToast({ title: 'Download Started', message: `Downloading: ${title.slice(0, 40)}...`, type: 'success' });
+      return;
+    }
+
+    if (torrentUrl) {
+      showToast({ title: 'Resolving Torrent', message: 'Resolving download link from tracker...', type: 'info' });
+      try {
+        const resolveUrl = `${getApiUrl('resolve-torrent')}?url=${encodeURIComponent(torrentUrl)}`;
+        const res = await fetch(resolveUrl, { headers: getHeaders() });
+        if (res.ok) {
+          const data = await res.json();
+          if (data.magnetUri) {
+            addUri(data.magnetUri, options);
+            showToast({ title: 'Download Started', message: `Downloading: ${title.slice(0, 40)}...`, type: 'success' });
+            return;
+          } else if (data.base64 && addTorrent) {
+            addTorrent(data.base64);
+            showToast({ title: 'Download Started', message: `Downloading: ${title.slice(0, 40)}...`, type: 'success' });
+            return;
+          } else if (data.error) {
+            showToast({ title: 'Download Error', message: data.error, type: 'error' });
+            return;
+          }
+        }
+      } catch (err) {
+        console.error('Failed to resolve torrent link:', err);
+      }
+    }
+
+    showToast({ title: 'Download Error', message: 'No download link or magnet URI found for this torrent', type: 'error' });
   };
 
   const formatAge = (pubDateStr: string) => {
@@ -408,9 +435,9 @@ export default function SearchTorrentsPage({ addUri, showToast }: SearchTorrents
                       </td>
                       <td className="p-4 text-center">
                         <button
-                          onClick={() => handleDownload(item.magnetUri, item.title, item.category || getCategoryNameForDownload())}
-                          disabled={!item.magnetUri}
-                          title={item.magnetUri ? "Download Torrent" : "Download URL not found"}
+                          onClick={() => handleDownload(item.magnetUri, item.title, item.category || getCategoryNameForDownload(), item.torrentUrl)}
+                          disabled={!item.magnetUri && !item.torrentUrl}
+                          title={item.magnetUri || item.torrentUrl ? "Download Torrent" : "Download URL not found"}
                           className="p-2 rounded-lg bg-cyan-500/10 hover:bg-cyan-500 text-cyan-400 hover:text-black border border-cyan-500/20 hover:border-transparent transition-all cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed"
                         >
                           <ArrowDown className="w-4 h-4" />
@@ -484,7 +511,7 @@ interface TrendingSectionProps {
   title: string;
   icon: React.ReactNode;
   items: TorrentResult[];
-  onDownload: (magnetUri: string, title: string, category?: string) => void;
+  onDownload: (magnetUri: string, title: string, category?: string, torrentUrl?: string) => void;
 }
 
 function getRtScoreColor(score: string): string {
@@ -590,10 +617,10 @@ function TrendingSection({ title, icon, items, onDownload }: TrendingSectionProp
 
               {/* Download button */}
               <button
-                onClick={() => onDownload(item.magnetUri, item.title)}
-                disabled={!item.magnetUri}
-                title={item.magnetUri ? "Download" : "No link"}
-                className="p-1.5 rounded-lg bg-cyan-500/10 hover:bg-cyan-500 text-cyan-400 hover:text-black border border-cyan-500/20 hover:border-transparent transition-all cursor-pointer self-center shrink-0"
+                onClick={() => onDownload(item.magnetUri, item.title, undefined, item.torrentUrl)}
+                disabled={!item.magnetUri && !item.torrentUrl}
+                title={item.magnetUri || item.torrentUrl ? "Download" : "No link"}
+                className="p-1.5 rounded-lg bg-cyan-500/10 hover:bg-cyan-500 text-cyan-400 hover:text-black border border-cyan-500/20 hover:border-transparent transition-all cursor-pointer self-center shrink-0 disabled:opacity-30 disabled:cursor-not-allowed"
               >
                 <ArrowDown className="w-3.5 h-3.5" />
               </button>
