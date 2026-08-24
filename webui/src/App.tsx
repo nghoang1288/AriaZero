@@ -636,8 +636,11 @@ function AppContent({
   const handleConfirmClearAll = async () => {
     setIsClearingAll(true);
     try {
+      const completedSeedingTasks = [...activeTasks, ...waitingTasks].filter(t => isTorrentCompleted(t) && !isMetadataTask(t));
+      const allCompletedTasks = [...stoppedTasks, ...completedSeedingTasks];
+
       const allPaths: string[] = [];
-      for (const task of stoppedTasks) {
+      for (const task of allCompletedTasks) {
         const paths = getPathsToDelete(task);
         if (deleteClearAllFiles) {
           allPaths.push(...paths);
@@ -674,6 +677,15 @@ function AppContent({
               message: 'Successfully deleted files for all stopped tasks.'
             });
           }
+        }
+      }
+
+      // Stop and remove completed seeding tasks from aria2
+      for (const task of completedSeedingTasks) {
+        try {
+          await removeTask(task.gid, task.status);
+        } catch (e) {
+          console.error(`Failed to remove seeding task ${task.gid}:`, e);
         }
       }
     } catch (e) {
