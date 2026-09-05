@@ -8,6 +8,7 @@ import threading
 import time
 import urllib.request
 import urllib.error
+import http.cookiejar
 import hashlib
 from urllib.parse import urlparse, parse_qs, urlencode, quote
 import xml.etree.ElementTree as ET
@@ -1019,6 +1020,125 @@ def resolve_jackett_torrent_link(url):
     except Exception as e:
         return {"error": f"Failed to resolve torrent link: {str(e)}"}
 
+def extract_gdrive_id(url):
+    if not url:
+        return None
+    patterns = [
+        r'drive\.google\.com/file/d/([a-zA-Z0-9_-]+)',
+        r'drive\.google\.com/open\?.*id=([a-zA-Z0-9_-]+)',
+        r'drive\.google\.com/uc\?.*id=([a-zA-Z0-9_-]+)',
+        r'drive\.usercontent\.google\.com/download\?.*id=([a-zA-Z0-9_-]+)',
+        r'docs\.google\.com/file/d/([a-zA-Z0-9_-]+)'
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return None
+
+def extract_filename_from_cd(disp):
+    if not disp:
+        return None
+    match = re.search(r'filename\*?=(?:UTF-8\'\')?([^;]+)', disp)
+    if match:
+        return urllib.parse.unquote(match.group(1).strip('"\''))
+    return None
+
+def extract_filename_from_html(html):
+    match = re.search(r'class="uc-name-size"[^>]*><a[^>]*>([^<]+)</a>', html) or \
+            re.search(r'class="uc-name-size"[^>]*>([^<]+)<', html) or \
+            re.search(r'<span[^>]+id="uc-text"[^>]*>([^<]+)</span>', html)
+    if match:
+        return match.group(1).strip()
+    return None
+
+def resolve_gdrive_download(url):
+    file_id = extract_gdrive_id(url)
+    if not file_id:
+        return {"error": "Invalid Google Drive URL"}
+    
+    cj = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+    }
+    
+    initial_url = f"https://drive.google.com/uc?id={file_id}&export=download"
+    try:
+        req = urllib.request.Request(initial_url, headers=headers)
+        with opener.open(req, timeout=15) as resp:
+            content_type = resp.headers.get('Content-Type', '')
+            final_url = resp.geturl()
+            disp = resp.headers.get('Content-Disposition', '')
+            filename = extract_filename_from_cd(disp)
+            
+            if 'text/html' not in content_type.lower():
+                return {
+                    "directUrl": final_url,
+                    "filename": filename,
+                    "fileId": file_id
+                }
+            
+            html = resp.read().decode('utf-8', errors='ignore')
+            fn = extract_filename_from_html(html) or filename
+            
+            form_match = re.search(r'action="(https://drive\.usercontent\.google\.com/download[^"]+)"', html)
+            if form_match:
+                confirm_url = form_match.group(1).replace('&amp;', '&')
+                inputs = re.findall(r'<input[^>]+type="hidden"[^>]+name="([^"]+)"[^>]+value="([^"]*)"', html)
+                if inputs:
+                    params = {name: val for name, val in inputs}
+                    if 'id' not in params:
+                        params['id'] = file_id
+                    confirm_url = f"https://drive.usercontent.google.com/download?{urllib.parse.urlencode(params)}"
+                
+                return {
+                    "directUrl": confirm_url,
+                    "filename": fn,
+                    "fileId": file_id
+                }
+
+            link_match = re.search(r'href="(https://drive\.usercontent\.google\.com/download[^"]+)"', html) or \
+                         re.search(r'href="(/uc\?export=download[^"]+confirm=[^"&]+)', html)
+            if link_match:
+                matched_href = link_match.group(1).replace('&amp;', '&')
+                if matched_href.startswith('/'):
+                    confirm_url = "https://drive.google.com" + matched_href
+                else:
+                    confirm_url = matched_href
+                
+                return {
+                    "directUrl": confirm_url,
+                    "filename": fn,
+                    "fileId": file_id
+                }
+
+            confirm_code = re.search(r'confirm=([a-zA-Z0-9_-]+)', html)
+            if confirm_code:
+                code = confirm_code.group(1)
+                confirm_url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm={code}"
+                return {
+                    "directUrl": confirm_url,
+                    "filename": fn,
+                    "fileId": file_id
+                }
+
+            fallback_url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm=t"
+            return {
+                "directUrl": fallback_url,
+                "filename": fn,
+                "fileId": file_id
+            }
+
+    except Exception as e:
+        return {
+            "directUrl": f"https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm=t",
+            "fileId": file_id,
+            "error": str(e)
+        }
+
 
 
 class DiskSpaceHandler(BaseHTTPRequestHandler):
@@ -1203,6 +1323,28 @@ class DiskSpaceHandler(BaseHTTPRequestHandler):
                     result = {"error": "Missing 'url' query parameter"}
                 else:
                     result = resolve_jackett_torrent_link(target_url)
+
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self._send_cors_headers()
+                self.end_headers()
+                self.wfile.write(json.dumps(result).encode('utf-8'))
+            except Exception as e:
+                self.send_response(500)
+                self.send_header('Content-Type', 'application/json')
+                self._send_cors_headers()
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
+        elif self.path.startswith('/api/resolve-gdrive'):
+            if not self.check_auth():
+                return
+            try:
+                query_params = parse_qs(urlparse(self.path).query)
+                target_url = query_params.get('url', [''])[0]
+                if not target_url:
+                    result = {"error": "Missing 'url' query parameter"}
+                else:
+                    result = resolve_gdrive_download(target_url)
 
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json')

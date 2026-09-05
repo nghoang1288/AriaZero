@@ -150,3 +150,8 @@ export function sanitizeMagnetLink(uri: string): string {
   return clean;
 }
 
+export function isGoogleDriveUrl(url: string): boolean {
+  if (!url) return false;
+  return /drive\.google\.com|drive\.usercontent\.google\.com|docs\.google\.com/i.test(url);
+}
+

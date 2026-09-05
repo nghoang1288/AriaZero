@@ -40,7 +40,8 @@ import {
   isSoftware, 
   isMetadataTask,
   getFileCategory,
-  sanitizeMagnetLink
+  sanitizeMagnetLink,
+  isGoogleDriveUrl
 } from './utils/taskUtils';
 
 import ConfirmModal from './components/ConfirmModal';
@@ -83,6 +84,7 @@ function App() {
   } = useAria2();
 
   const { showToast } = useToast();
+  const { getApiUrl } = useApiUrl();
 
   const [activeTab, setActiveTab] = useState<'dashboard' | 'downloads' | 'search' | 'settings'>('dashboard');
   const [showAddModal, setShowAddModal] = useState(false);
@@ -101,9 +103,69 @@ function App() {
     localStorage.setItem('ariazero_theme', next);
   };
 
-  // Wrap addUri with auto-categorization options
-  const addUriWithCategory = useCallback((uri: string, options?: Record<string, string>) => {
+  // Wrap addUri with auto-categorization and Google Drive resolution
+  const addUriWithCategory = useCallback(async (uri: string, options?: Record<string, string>) => {
     const sanitizedUri = sanitizeMagnetLink(uri);
+
+    // Handle Google Drive links
+    if (isGoogleDriveUrl(sanitizedUri)) {
+      showToast({
+        type: 'info',
+        title: 'Google Drive Link Detected',
+        message: 'Resolving direct download URL from Google Drive...'
+      });
+      try {
+        const resolveUrl = `${getApiUrl('resolve-gdrive')}?url=${encodeURIComponent(sanitizedUri)}`;
+        const secret = (window as any).AriaZeroServerConfig?.rpcSecret || '';
+        const headers: Record<string, string> = {};
+        if (secret) {
+          headers['Authorization'] = `Bearer ${secret}`;
+        }
+        const res = await fetch(resolveUrl, { headers });
+        if (res.ok) {
+          const data = await res.json();
+          if (data.directUrl) {
+            const mergedOptions: Record<string, string> = { ...options };
+            if (data.filename) {
+              mergedOptions.out = data.filename;
+            }
+            mergedOptions.header = 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
+
+            // Auto-categorize if filename is known
+            if (data.filename) {
+              const baseDir = globalOptionsRef.current.dir || '/downloads';
+              const category = getFileCategory(data.filename);
+              let subfolder = '';
+              if (category === 'video' || isVideoName(data.filename)) subfolder = 'Movies';
+              else if (category === 'audio') subfolder = localStorage.getItem('ariazero_audio_folder') || 'Audio';
+              else if (category === 'documents') subfolder = localStorage.getItem('ariazero_doc_folder') || 'Documents';
+              else if (category === 'software') subfolder = localStorage.getItem('ariazero_software_folder') || 'Software';
+
+              if (subfolder && !mergedOptions.dir) {
+                const cleanBaseDir = baseDir.replace(/[/\\]$/, '');
+                mergedOptions.dir = `${cleanBaseDir}/${subfolder}`;
+              }
+            }
+
+            showToast({
+              type: 'success',
+              title: 'Google Drive Resolved',
+              message: `Starting download: ${data.filename || 'Google Drive File'}`
+            });
+            return addUri(data.directUrl, Object.keys(mergedOptions).length > 0 ? mergedOptions : undefined);
+          } else if (data.error) {
+            showToast({
+              type: 'error',
+              title: 'Google Drive Error',
+              message: data.error
+            });
+          }
+        }
+      } catch (err) {
+        console.error('Failed to resolve Google Drive link:', err);
+      }
+    }
+
     const autoCategorizeEnabled = localStorage.getItem('ariazero_auto_categorize_enabled') !== 'false';
     const baseDir = globalOptionsRef.current.dir || '/downloads';
 
@@ -144,7 +206,7 @@ function App() {
       }
     }
     return addUri(sanitizedUri, Object.keys(mergedOptions).length > 0 ? mergedOptions : undefined);
-  }, [addUri]);
+  }, [addUri, showToast, getApiUrl]);
 
   // Smart download handler: when a link is detected from clipboard/magnet/drag
   const handleLinkDetected = useCallback((url: string, source?: 'url_param' | 'clipboard' | 'drag') => {
