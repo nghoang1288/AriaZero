@@ -1082,8 +1082,19 @@ def resolve_gdrive_download(url):
                 }
             
             html = resp.read().decode('utf-8', errors='ignore')
+            
+            # Check for error pages on initial HTML
+            if 'Quota exceeded' in html or 'too many users' in html.lower() or 'downloadQuotaExceeded' in html:
+                return {"error": "Google Drive Quota Exceeded: File has been downloaded too many times recently. Google has temporarily limited downloads for this file."}
+            if 'You need access' in html or 'You need permission' in html or 'access-denied' in html:
+                return {"error": "Google Drive Access Denied: This file is private or requires permission to access."}
+            if 'File does not exist' in html or 'Item has been deleted' in html:
+                return {"error": "Google Drive Error: File does not exist or has been deleted."}
+
             fn = extract_filename_from_html(html) or filename
             
+            # Extract confirm parameters from form or link
+            confirm_url = None
             form_match = re.search(r'action="(https://drive\.usercontent\.google\.com/download[^"]+)"', html)
             if form_match:
                 confirm_url = form_match.group(1).replace('&amp;', '&')
@@ -1093,50 +1104,47 @@ def resolve_gdrive_download(url):
                     if 'id' not in params:
                         params['id'] = file_id
                     confirm_url = f"https://drive.usercontent.google.com/download?{urllib.parse.urlencode(params)}"
-                
-                return {
-                    "directUrl": confirm_url,
-                    "filename": fn,
-                    "fileId": file_id
-                }
-
-            link_match = re.search(r'href="(https://drive\.usercontent\.google\.com/download[^"]+)"', html) or \
-                         re.search(r'href="(/uc\?export=download[^"]+confirm=[^"&]+)', html)
-            if link_match:
-                matched_href = link_match.group(1).replace('&amp;', '&')
-                if matched_href.startswith('/'):
-                    confirm_url = "https://drive.google.com" + matched_href
+            else:
+                link_match = re.search(r'href="(https://drive\.usercontent\.google\.com/download[^"]+)"', html) or \
+                             re.search(r'href="(/uc\?export=download[^"]+confirm=[^"&]+)', html)
+                if link_match:
+                    matched_href = link_match.group(1).replace('&amp;', '&')
+                    if matched_href.startswith('/'):
+                        confirm_url = "https://drive.google.com" + matched_href
+                    else:
+                        confirm_url = matched_href
                 else:
-                    confirm_url = matched_href
-                
-                return {
-                    "directUrl": confirm_url,
-                    "filename": fn,
-                    "fileId": file_id
-                }
+                    confirm_code = re.search(r'confirm=([a-zA-Z0-9_-]+)', html)
+                    if confirm_code:
+                        code = confirm_code.group(1)
+                        confirm_url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm={code}"
 
-            confirm_code = re.search(r'confirm=([a-zA-Z0-9_-]+)', html)
-            if confirm_code:
-                code = confirm_code.group(1)
-                confirm_url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm={code}"
-                return {
-                    "directUrl": confirm_url,
-                    "filename": fn,
-                    "fileId": file_id
-                }
+            if not confirm_url:
+                confirm_url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm=t"
 
-            fallback_url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm=t"
+            # Verify confirm URL to ensure it doesn't return Quota Exceeded page
+            try:
+                verify_req = urllib.request.Request(confirm_url, headers=headers)
+                with opener.open(verify_req, timeout=15) as verify_resp:
+                    v_ct = verify_resp.headers.get('Content-Type', '')
+                    if 'text/html' in v_ct.lower():
+                        v_html = verify_resp.read().decode('utf-8', errors='ignore')
+                        if 'Quota exceeded' in v_html or 'too many users' in v_html.lower() or 'downloadQuotaExceeded' in v_html:
+                            return {"error": "Google Drive Quota Exceeded: File has been downloaded too many times recently. Google has temporarily limited downloads for this file."}
+                        if 'You need access' in v_html or 'You need permission' in v_html:
+                            return {"error": "Google Drive Access Denied: This file is private or requires permission to access."}
+            except Exception as e_v:
+                pass
+
             return {
-                "directUrl": fallback_url,
+                "directUrl": confirm_url,
                 "filename": fn,
                 "fileId": file_id
             }
 
     except Exception as e:
         return {
-            "directUrl": f"https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm=t",
-            "fileId": file_id,
-            "error": str(e)
+            "error": f"Failed to resolve Google Drive link: {str(e)}"
         }
 
 
