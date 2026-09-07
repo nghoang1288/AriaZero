@@ -68,7 +68,7 @@ export function SmartDownloadProvider({
   const downloadRegex = useMemo(() => {
     const extList = extensions.split(',').map(e => e.trim().toLowerCase()).filter(Boolean);
     const escaped = extList.map(ext => ext.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
-    return new RegExp(`(https?:\\/\\/[^\\s]+\\.(${escaped})([?#][^\\s]*)?|magnet:\\?xt=urn:[^\\s]+)`, 'gi');
+    return new RegExp(`(https?:\\/\\/[^\\s]+\\.(${escaped})([?#][^\\s]*)?|magnet:\\?xt=urn:[^\\s]+|https?:\\/\\/(?:drive|docs)\\.google\\.com\\/[^\\s"']+)`, 'gi');
   }, [extensions]);
 
   // Stable callback ref so listeners always see the latest function.

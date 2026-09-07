@@ -28,9 +28,10 @@ export default function DashboardPage({
   }, [allActiveAndWaiting]);
 
   const completedCount = useMemo(() => {
-    const stoppedComplete = stoppedTasks.filter((t: Aria2Task) => t.status === 'complete' && !isMetadataTask(t)).length;
-    const activeTorrentComplete = allActiveAndWaiting.filter((t: Aria2Task) => isTorrentCompleted(t) && !isMetadataTask(t)).length;
-    return stoppedComplete + activeTorrentComplete;
+    const activeTorrentComplete = allActiveAndWaiting.filter((t: Aria2Task) => isTorrentCompleted(t) && !isMetadataTask(t));
+    const activeGids = new Set(activeTorrentComplete.map(t => t.gid));
+    const stoppedComplete = stoppedTasks.filter((t: Aria2Task) => t.status === 'complete' && !isMetadataTask(t) && !activeGids.has(t.gid));
+    return activeTorrentComplete.length + stoppedComplete.length;
   }, [stoppedTasks, allActiveAndWaiting]);
 
   const queuePausedCount = useMemo(() => {

@@ -1,6 +1,7 @@
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import re
+import html
 import shutil
 import os
 import sqlite3
@@ -73,13 +74,31 @@ def init_db():
                 name TEXT
             )
         ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS gdrive_retry_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                url TEXT UNIQUE,
+                filename TEXT,
+                added_at INTEGER,
+                last_tried INTEGER,
+                attempts INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'pending',
+                error TEXT
+            )
+        ''')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_dh_completed_time ON download_history(completed_time DESC)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_dh_name ON download_history(name)')
-        # Clean up any leftover metadata items from history
-        cursor.execute("DELETE FROM download_history WHERE name LIKE '[METADATA]%' OR name LIKE 'metadata%'")
+        # Clean up any leftover metadata items or bogus html files from history
+        cursor.execute("DELETE FROM download_history WHERE name LIKE '[METADATA]%' OR name LIKE 'metadata%' OR name = 'download'")
         conn.commit()
     finally:
         conn.close()
+
+    try:
+        if os.path.exists("/downloads/download"):
+            os.remove("/downloads/download")
+    except Exception:
+        pass
     
     # Automatically scan existing downloaded files on disk once if needed
     try:
@@ -1049,14 +1068,91 @@ def extract_filename_from_html(html):
             re.search(r'class="uc-name-size"[^>]*>([^<]+)<', html) or \
             re.search(r'<span[^>]+id="uc-text"[^>]*>([^<]+)</span>', html)
     if match:
-        return match.group(1).strip()
+        return html.unescape(match.group(1).strip())
     return None
+
+def cleanup_gdrive_copy_later(copy_id, access_token, delay_seconds=7200):
+    """Automatically delete the temporary Google Drive file copy after delay."""
+    time.sleep(delay_seconds)
+    delete_url = f"https://www.googleapis.com/drive/v3/files/{copy_id}"
+    headers = {'Authorization': f'Bearer {access_token}'}
+    try:
+        req = urllib.request.Request(delete_url, headers=headers, method='DELETE')
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            print(f"Auto-deleted temporary Google Drive copy {copy_id}")
+    except Exception as e:
+        print(f"Failed to delete temporary Google Drive copy {copy_id}: {e}")
+
+def gdrive_api_copy_and_download(file_id, access_token):
+    """Bypass Google Drive quota limit by automatically creating a copy in the user's Drive via API."""
+    copy_url = f"https://www.googleapis.com/drive/v3/files/{file_id}/copy"
+    headers = {
+        'Authorization': f'Bearer {access_token}',
+        'Content-Type': 'application/json'
+    }
+    try:
+        req = urllib.request.Request(copy_url, data=b'{}', headers=headers, method='POST')
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+            copy_id = data.get('id')
+            original_name = data.get('name')
+            if copy_id:
+                media_url = f"https://www.googleapis.com/drive/v3/files/{copy_id}?alt=media"
+                threading.Thread(target=cleanup_gdrive_copy_later, args=(copy_id, access_token, 7200), daemon=True).start()
+                return {
+                    "directUrl": media_url,
+                    "filename": original_name,
+                    "fileId": file_id,
+                    "authHeader": f"Authorization: Bearer {access_token}"
+                }
+    except urllib.error.HTTPError as e:
+        err_msg = e.read().decode('utf-8', errors='ignore')
+        return {"error": f"Google Drive API Error ({e.code}): {err_msg}"}
+    except Exception as e:
+        return {"error": f"Google Drive API Exception: {str(e)}"}
+    return None
+
+def get_fresh_gdrive_access_token():
+    settings = get_all_system_settings()
+    access_token = settings.get("gdrive_access_token", "").strip()
+    refresh_token = settings.get("gdrive_refresh_token", "").strip()
+
+    if refresh_token:
+        client_id = settings.get("gdrive_client_id", "").strip() or "407408718192-ptthi26rfd4mctct47v5chg4m698887n.apps.googleusercontent.com"
+        client_secret = settings.get("gdrive_client_secret", "").strip()
+        try:
+            req_data = urllib.parse.urlencode({
+                'grant_type': 'refresh_token',
+                'refresh_token': refresh_token,
+                'client_id': client_id,
+                'client_secret': client_secret
+            }).encode('utf-8')
+            req = urllib.request.Request("https://oauth2.googleapis.com/token", data=req_data, method="POST")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode('utf-8'))
+                new_token = data.get("access_token")
+                if new_token:
+                    conn = get_db_connection()
+                    try:
+                        cursor = conn.cursor()
+                        cursor.execute('INSERT INTO system_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', ("gdrive_access_token", new_token))
+                        conn.commit()
+                    finally:
+                        conn.close()
+                    return new_token
+        except Exception as e:
+            print(f"[GDrive Token] Auto-refresh access token error: {e}")
+    return access_token
 
 def resolve_gdrive_download(url):
     file_id = extract_gdrive_id(url)
     if not file_id:
         return {"error": "Invalid Google Drive URL"}
     
+    access_token = get_fresh_gdrive_access_token()
+    settings = get_all_system_settings()
+    cookie_str = settings.get("gdrive_cookie", "").strip()
+
     cj = http.cookiejar.CookieJar()
     opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
     headers = {
@@ -1064,7 +1160,11 @@ def resolve_gdrive_download(url):
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.9',
     }
-    
+    if cookie_str:
+        headers['Cookie'] = cookie_str
+    if access_token:
+        headers['Authorization'] = f'Bearer {access_token}'
+
     initial_url = f"https://drive.google.com/uc?id={file_id}&export=download"
     try:
         req = urllib.request.Request(initial_url, headers=headers)
@@ -1083,9 +1183,15 @@ def resolve_gdrive_download(url):
             
             html = resp.read().decode('utf-8', errors='ignore')
             
-            # Check for error pages on initial HTML
-            if 'Quota exceeded' in html or 'too many users' in html.lower() or 'downloadQuotaExceeded' in html:
-                return {"error": "Google Drive Quota Exceeded: File has been downloaded too many times recently. Google has temporarily limited downloads for this file."}
+            # Check for Quota Exceeded error
+            is_quota_error = 'Quota exceeded' in html or 'too many users' in html.lower() or 'downloadQuotaExceeded' in html
+            if is_quota_error and access_token:
+                api_res = gdrive_api_copy_and_download(file_id, access_token)
+                if api_res and "directUrl" in api_res:
+                    return api_res
+                elif api_res and "error" in api_res:
+                    return {"error": f"Bypass Quota thất bại do Google tạm thời khóa cứng file này 24h (Hard Rate Limit toàn cầu): {api_res['error']}"}
+                return {"error": "Google Drive Quota Exceeded: File has been downloaded too many times recently. Please configure Google Drive Access Token in Settings to enable automated API copy bypass."}
             if 'You need access' in html or 'You need permission' in html or 'access-denied' in html:
                 return {"error": "Google Drive Access Denied: This file is private or requires permission to access."}
             if 'File does not exist' in html or 'Item has been deleted' in html:
@@ -1122,7 +1228,7 @@ def resolve_gdrive_download(url):
             if not confirm_url:
                 confirm_url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm=t"
 
-            # Verify confirm URL to ensure it doesn't return Quota Exceeded page
+            # Verify confirm URL to ensure it doesn't return Quota Exceeded or HTML error page
             try:
                 verify_req = urllib.request.Request(confirm_url, headers=headers)
                 with opener.open(verify_req, timeout=15) as verify_resp:
@@ -1130,9 +1236,24 @@ def resolve_gdrive_download(url):
                     if 'text/html' in v_ct.lower():
                         v_html = verify_resp.read().decode('utf-8', errors='ignore')
                         if 'Quota exceeded' in v_html or 'too many users' in v_html.lower() or 'downloadQuotaExceeded' in v_html:
-                            return {"error": "Google Drive Quota Exceeded: File has been downloaded too many times recently. Google has temporarily limited downloads for this file."}
-                        if 'You need access' in v_html or 'You need permission' in v_html:
-                            return {"error": "Google Drive Access Denied: This file is private or requires permission to access."}
+                            if access_token:
+                                api_res = gdrive_api_copy_and_download(file_id, access_token)
+                                if api_res and "directUrl" in api_res:
+                                    return api_res
+                            return {"error": "Google Drive Quota Exceeded: File has been downloaded too many times recently. Please configure Google Drive Access Token in Settings to enable automated API copy bypass."}
+                        if 'permission to download' in v_html or "hasn't given you permission" in v_html or "haven't given you permission" in v_html or "Can't download file" in v_html:
+                            return {"error": "Chủ sở hữu file Google Drive này đã khóa quyền tải về (Chỉ cho phép xem, đã tắt tính năng cho phép người xem tải xuống)."}
+                        if 'You need access' in v_html or 'You need permission' in v_html or 'access-denied' in v_html:
+                            return {"error": "Google Drive Access Denied: File này ở chế độ riêng tư hoặc cần quyền truy cập."}
+                        if 'File does not exist' in v_html or 'Item has been deleted' in v_html:
+                            return {"error": "Google Drive Error: File không tồn tại hoặc đã bị xóa."}
+                        return {"error": "Google Drive trả về trang web HTML thay vì file dữ liệu (Không thể tải về trực tiếp)."}
+            except urllib.error.HTTPError as he:
+                if he.code == 403:
+                    return {"error": "Google Drive 403: Không có quyền truy cập hoặc file bị khóa tải về."}
+                elif he.code == 404:
+                    return {"error": "Google Drive 404: File không tồn tại hoặc đã bị xóa."}
+                return {"error": f"Google Drive HTTP Error {he.code}: {he.reason}"}
             except Exception as e_v:
                 pass
 
@@ -1143,9 +1264,220 @@ def resolve_gdrive_download(url):
             }
 
     except Exception as e:
+        if access_token:
+            api_res = gdrive_api_copy_and_download(file_id, access_token)
+            if api_res and "directUrl" in api_res:
+                return api_res
         return {
             "error": f"Failed to resolve Google Drive link: {str(e)}"
         }
+
+def get_public_gdrive_filename(file_id):
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    }
+    try:
+        uc_url = f"https://drive.google.com/uc?id={file_id}&export=download"
+        req = urllib.request.Request(uc_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            html = resp.read().decode('utf-8', errors='ignore')
+            m = re.search(r'class="uc-name-size"[^>]*><a[^>]*>([^<]+)</a>', html) or \
+                re.search(r'class="uc-name-size"[^>]*>([^<]+)<', html) or \
+                re.search(r'<span[^>]+id="uc-text"[^>]*>([^<]+)</span>', html)
+            if m:
+                return html.unescape(urllib.parse.unquote(m.group(1).strip()))
+    except Exception:
+        pass
+
+    try:
+        view_url = f"https://drive.google.com/file/d/{file_id}/view"
+        req = urllib.request.Request(view_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            html_text = resp.read().decode('utf-8', errors='ignore')
+            m = re.search(r'<meta property="og:title" content="([^"]+)">', html_text)
+            if m:
+                name = html.unescape(urllib.parse.unquote(m.group(1).strip()))
+                if name and not name.lower().startswith('google drive'):
+                    return name
+            t = re.search(r'<title>([^<]+)</title>', html_text)
+            if t:
+                title = html.unescape(urllib.parse.unquote(t.group(1).replace(' - Google Drive', '').strip()))
+                if title and not title.lower().startswith('google drive'):
+                    return title
+    except Exception:
+        pass
+    return None
+
+def add_to_gdrive_queue(url, filename=None):
+    if not url:
+        return False
+    
+    if not filename:
+        file_id = extract_gdrive_id(url)
+        if file_id:
+            access_token = get_fresh_gdrive_access_token()
+            if access_token:
+                try:
+                    meta_req = urllib.request.Request(
+                        f"https://www.googleapis.com/drive/v3/files/{file_id}?fields=name",
+                        headers={"Authorization": f"Bearer {access_token}"}
+                    )
+                    with urllib.request.urlopen(meta_req, timeout=5) as meta_resp:
+                        meta_data = json.loads(meta_resp.read().decode('utf-8'))
+                        filename = meta_data.get("name")
+                except Exception:
+                    pass
+            if not filename:
+                filename = get_public_gdrive_filename(file_id)
+
+    now_ts = int(time.time())
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO gdrive_retry_queue (url, filename, added_at, last_tried, status)
+            VALUES (?, ?, ?, ?, 'pending')
+            ON CONFLICT(url) DO UPDATE SET status='pending', attempts=0, last_tried=excluded.last_tried, filename=COALESCE(excluded.filename, gdrive_retry_queue.filename)
+        ''', (url, filename, now_ts, now_ts))
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"Error adding to gdrive_retry_queue: {e}")
+        return False
+    finally:
+        conn.close()
+
+def get_gdrive_queue():
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, url, filename, added_at, last_tried, attempts, status, error FROM gdrive_retry_queue WHERE status = 'pending' ORDER BY added_at DESC")
+        rows = cursor.fetchall()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        print(f"Error reading gdrive_retry_queue: {e}")
+        return []
+    finally:
+        conn.close()
+
+def delete_from_gdrive_queue(qid):
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM gdrive_retry_queue WHERE id = ? OR url = ?", (qid, qid))
+        conn.commit()
+        return True
+    except Exception:
+        return False
+    finally:
+        conn.close()
+
+def retry_gdrive_queue_item(qid):
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, url, filename FROM gdrive_retry_queue WHERE id = ? OR url = ?", (qid, qid))
+        row = cursor.fetchone()
+        if not row:
+            return {"error": "Item not found in queue"}
+        
+        g_url = row["url"]
+        res = resolve_gdrive_download(g_url)
+        now_ts = int(time.time())
+        if res and "directUrl" in res:
+            header_str = None
+            if "authHeader" in res:
+                header_str = f"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\n{res['authHeader']}"
+            fn = res.get("filename") or row["filename"]
+            gid = send_to_aria2(res["directUrl"], filename=fn, header_str=header_str)
+            cursor.execute("UPDATE gdrive_retry_queue SET status = 'completed', last_tried = ?, error = NULL WHERE id = ?", (now_ts, row["id"]))
+            conn.commit()
+            return {"success": True, "downloadStarted": True, "gid": gid}
+        else:
+            err_text = res.get("error", "Google vẫn đang áp dụng giới hạn Quota 24h") if isinstance(res, dict) else "Unknown error"
+            cursor.execute("UPDATE gdrive_retry_queue SET attempts = attempts + 1, last_tried = ?, error = ? WHERE id = ?", (now_ts, err_text, row["id"]))
+            conn.commit()
+            return {"success": False, "error": err_text}
+    finally:
+        conn.close()
+
+def send_to_aria2(direct_url, filename=None, header_str=None):
+    secret = os.environ.get('ARIA2_RPC_SECRET')
+    aria2_port = os.environ.get('ARIA2_RPC_PORT', '6800')
+    url = f"http://127.0.0.1:{aria2_port}/jsonrpc"
+
+    opts = {}
+    if filename:
+        opts["out"] = filename
+    if header_str:
+        opts["header"] = header_str
+    else:
+        opts["header"] = "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+
+    if filename:
+        fn_lower = filename.lower()
+        if any(ext in fn_lower for ext in ['.mkv', '.mp4', '.avi', '.mov']):
+            if re.search(r'\bs\d{1,2}e\d{1,2}\b', fn_lower):
+                opts["dir"] = "/downloads/TV Series"
+            else:
+                opts["dir"] = "/downloads/Movies"
+        elif any(ext in fn_lower for ext in ['.iso', '.zip', '.rar', '.exe']):
+            opts["dir"] = "/downloads/Games"
+
+    params = [f"token:{secret}"] if secret else []
+    params.extend([[direct_url], opts])
+
+    payload = {
+        "jsonrpc": "2.0",
+        "id": "gdrive_auto_downloader",
+        "method": "aria2.addUri",
+        "params": params
+    }
+    headers = {"Content-Type": "application/json"}
+    req = urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'), headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        res = json.loads(resp.read().decode('utf-8'))
+        return res.get("result")
+
+def gdrive_queue_poller():
+    """Periodically checks pending Google Drive URLs in gdrive_retry_queue every 30 minutes."""
+    time.sleep(15)
+    while True:
+        try:
+            items = get_gdrive_queue()
+            pending_items = [item for item in items if item.get("status") == "pending"]
+            for item in pending_items:
+                qid = item["id"]
+                g_url = item["url"]
+
+                res = resolve_gdrive_download(g_url)
+                now_ts = int(time.time())
+
+                if res and "directUrl" in res:
+                    header_str = None
+                    if "authHeader" in res:
+                        header_str = f"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\n{res['authHeader']}"
+                    
+                    fn = res.get("filename") or item.get("filename")
+                    gid = send_to_aria2(res["directUrl"], filename=fn, header_str=header_str)
+                    
+                    conn = get_db_connection()
+                    cursor = conn.cursor()
+                    cursor.execute("UPDATE gdrive_retry_queue SET status = 'completed', last_tried = ?, error = NULL WHERE id = ?", (now_ts, qid))
+                    conn.commit()
+                    conn.close()
+                    print(f"[GDrive Auto-Queue] Successfully resolved & started download for {g_url} (GID: {gid})")
+                else:
+                    err_text = res.get("error", "Quota limit still active") if isinstance(res, dict) else "Unknown error"
+                    conn = get_db_connection()
+                    cursor = conn.cursor()
+                    cursor.execute("UPDATE gdrive_retry_queue SET attempts = attempts + 1, last_tried = ?, error = ? WHERE id = ?", (now_ts, err_text, qid))
+                    conn.commit()
+                    conn.close()
+        except Exception as e:
+            print(f"[GDrive Auto-Queue] Error in poller: {e}")
+
+        time.sleep(1800)  # 30 minutes
 
 
 
@@ -1352,13 +1684,71 @@ class DiskSpaceHandler(BaseHTTPRequestHandler):
                 if not target_url:
                     result = {"error": "Missing 'url' query parameter"}
                 else:
-                    result = resolve_gdrive_download(target_url)
+                    file_id = extract_gdrive_id(target_url)
+                    force = query_params.get('force', ['0'])[0].lower() in ('1', 'true')
+                    
+                    conn = get_db_connection()
+                    try:
+                        cursor = conn.cursor()
+                        # 1. Check if already in gdrive_retry_queue (status='pending')
+                        cursor.execute("SELECT id, filename, attempts FROM gdrive_retry_queue WHERE status = 'pending' AND (url = ? OR url LIKE ?)", (target_url, f"%{file_id}%"))
+                        existing_q = cursor.fetchone()
+                        if existing_q and not force:
+                            result = {
+                                "alreadyQueued": True,
+                                "filename": existing_q["filename"],
+                                "queueMessage": f"Tệp '{existing_q['filename'] or 'Google Drive'}' đã có sẵn trong Hàng chờ Google Drive (đang đợi mở Quota)!"
+                            }
+                        else:
+                            # 2. Check if file is already completed
+                            guessed_fn = get_public_gdrive_filename(file_id) if file_id else None
+                            is_completed = False
+                            if guessed_fn:
+                                cursor.execute("SELECT name FROM download_history WHERE name = ? AND status = 'complete' LIMIT 1", (guessed_fn,))
+                                if cursor.fetchone():
+                                    is_completed = True
+                                elif os.path.exists("/downloads"):
+                                    for root, dirs, files in os.walk("/downloads"):
+                                        if guessed_fn in files and not os.path.exists(os.path.join(root, f"{guessed_fn}.aria2")):
+                                            is_completed = True
+                                            break
+                            if is_completed and not force:
+                                result = {
+                                    "alreadyCompleted": True,
+                                    "filename": guessed_fn,
+                                    "message": f"Tệp '{guessed_fn}' đã được tải hoàn tất trước đó rồi!"
+                                }
+                            else:
+                                result = resolve_gdrive_download(target_url)
+                                if result and "error" in result:
+                                    fn = result.get("filename") or guessed_fn
+                                    add_to_gdrive_queue(target_url, filename=fn)
+                                    result["autoQueued"] = True
+                                    result["queueMessage"] = "Link Google Drive bị dính 24h Quota. Hệ thống đã TỰ ĐỘNG THÊM VÀO HÀNG CHỜ và sẽ tự động kiểm tra mỗi 30 phút để khởi chạy download ngay khi Google mở lại Quota!"
+                    finally:
+                        conn.close()
 
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json')
                 self._send_cors_headers()
                 self.end_headers()
                 self.wfile.write(json.dumps(result).encode('utf-8'))
+            except Exception as e:
+                self.send_response(500)
+                self.send_header('Content-Type', 'application/json')
+                self._send_cors_headers()
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
+        elif self.path == '/api/gdrive-queue':
+            if not self.check_auth():
+                return
+            try:
+                queue_data = get_gdrive_queue()
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self._send_cors_headers()
+                self.end_headers()
+                self.wfile.write(json.dumps(queue_data).encode('utf-8'))
             except Exception as e:
                 self.send_response(500)
                 self.send_header('Content-Type', 'application/json')
@@ -1617,6 +2007,56 @@ class DiskSpaceHandler(BaseHTTPRequestHandler):
                 self._send_cors_headers()
                 self.end_headers()
                 self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
+        elif self.path == '/api/gdrive-queue/delete':
+            if not self.check_auth():
+                return
+            try:
+                content_length_str = self.headers.get('Content-Length')
+                content_length = int(content_length_str) if content_length_str else 0
+                if content_length > 0:
+                    post_data = self.rfile.read(content_length)
+                    req_data = json.loads(post_data.decode('utf-8'))
+                    qid = req_data.get("id") or req_data.get("url")
+                    delete_from_gdrive_queue(qid)
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self._send_cors_headers()
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": True}).encode('utf-8'))
+            except Exception as e:
+                self.send_response(500)
+                self.send_header('Content-Type', 'application/json')
+                self._send_cors_headers()
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
+        elif self.path == '/api/gdrive-queue/retry':
+            if not self.check_auth():
+                return
+            try:
+                content_length_str = self.headers.get('Content-Length')
+                content_length = int(content_length_str) if content_length_str else 0
+                if content_length > 0:
+                    post_data = self.rfile.read(content_length)
+                    req_data = json.loads(post_data.decode('utf-8'))
+                    qid = req_data.get("id") or req_data.get("url")
+                    retry_res = retry_gdrive_queue_item(qid)
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self._send_cors_headers()
+                    self.end_headers()
+                    self.wfile.write(json.dumps(retry_res).encode('utf-8'))
+                else:
+                    self.send_response(400)
+                    self.send_header('Content-Type', 'application/json')
+                    self._send_cors_headers()
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": "Missing payload"}).encode('utf-8'))
+            except Exception as e:
+                self.send_response(500)
+                self.send_header('Content-Type', 'application/json')
+                self._send_cors_headers()
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": str(e)}).encode('utf-8'))
         else:
             self.send_response(404)
             self.end_headers()
@@ -1633,6 +2073,10 @@ def run(port=8080):
     # Start the tracker updater poller to auto-update public trackers daily
     t3 = threading.Thread(target=tracker_updater_poller, daemon=True)
     t3.start()
+
+    # Start the Google Drive auto-retry poller to automatically retry Quota Exceeded links every 30 mins
+    t4 = threading.Thread(target=gdrive_queue_poller, daemon=True)
+    t4.start()
     
     server_address = ('127.0.0.1', port)
     httpd = ThreadingHTTPServer(server_address, DiskSpaceHandler)

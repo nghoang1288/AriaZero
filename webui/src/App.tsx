@@ -41,7 +41,9 @@ import {
   isMetadataTask,
   getFileCategory,
   sanitizeMagnetLink,
-  isGoogleDriveUrl
+  isGoogleDriveUrl,
+  extractGdriveId,
+  parseDownloadUrls
 } from './utils/taskUtils';
 
 import ConfirmModal from './components/ConfirmModal';
@@ -107,6 +109,44 @@ function App() {
   const addUriWithCategory = useCallback(async (uri: string, options?: Record<string, string>) => {
     const sanitizedUri = sanitizeMagnetLink(uri);
 
+    // 1. Check if link is already active or waiting in Aria2
+    const gdriveId = isGoogleDriveUrl(sanitizedUri) ? extractGdriveId(sanitizedUri) : null;
+    const isAlreadyActive = allActiveAndWaiting.some(t => {
+      return t.files?.some(f => f.uris?.some(u => {
+        const cleanU = u.uri.replace(/[,\s;]+$/, '').trim();
+        if (cleanU === sanitizedUri) return true;
+        if (gdriveId && isGoogleDriveUrl(cleanU) && extractGdriveId(cleanU) === gdriveId) return true;
+        return false;
+      }));
+    });
+    if (isAlreadyActive) {
+      showToast({
+        type: 'warning',
+        title: 'Tệp đang được tải',
+        message: 'Liên kết này đã có trong danh sách Active Downloads đang tải về!'
+      });
+      return;
+    }
+
+    // 2. Check if already completed in stoppedTasks
+    const isAlreadyCompleted = stoppedTasks.some(t => {
+      if (t.status !== 'complete') return false;
+      return t.files?.some(f => f.uris?.some(u => {
+        const cleanU = u.uri.replace(/[,\s;]+$/, '').trim();
+        if (cleanU === sanitizedUri) return true;
+        if (gdriveId && isGoogleDriveUrl(cleanU) && extractGdriveId(cleanU) === gdriveId) return true;
+        return false;
+      }));
+    });
+    if (isAlreadyCompleted) {
+      showToast({
+        type: 'warning',
+        title: 'Tệp đã tải hoàn tất',
+        message: 'Liên kết này đã được tải về thành công trước đó (nằm trong mục Completed)!'
+      });
+      return;
+    }
+
     // Handle Google Drive links
     if (isGoogleDriveUrl(sanitizedUri)) {
       showToast({
@@ -124,12 +164,32 @@ function App() {
         const res = await fetch(resolveUrl, { headers });
         if (res.ok) {
           const data = await res.json();
+          if (data.alreadyCompleted) {
+            showToast({
+              type: 'warning',
+              title: 'Tệp đã tải xong trước đó',
+              message: `Tệp "${data.filename}" đã có sẵn trong thư mục máy chủ (không tải trùng lặp).`
+            });
+            return;
+          }
+          if (data.alreadyQueued) {
+            showToast({
+              type: 'info',
+              title: 'Đã có trong hàng chờ',
+              message: data.queueMessage || `Tệp "${data.filename || 'Google Drive'}" đã có sẵn trong Hàng chờ Google Drive (đang đợi mở Quota)!`
+            });
+            return;
+          }
           if (data.directUrl) {
             const mergedOptions: Record<string, string> = { ...options };
             if (data.filename) {
               mergedOptions.out = data.filename;
             }
-            mergedOptions.header = 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
+            if (data.authHeader) {
+              mergedOptions.header = `User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36\r\n${data.authHeader}`;
+            } else {
+              mergedOptions.header = 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
+            }
 
             // Auto-categorize if filename is known
             if (data.filename) {
@@ -155,10 +215,11 @@ function App() {
             return addUri(data.directUrl, Object.keys(mergedOptions).length > 0 ? mergedOptions : undefined);
           } else if (data.error) {
             showToast({
-              type: 'error',
-              title: 'Google Drive Error',
-              message: data.error
+              type: 'info',
+              title: 'Google Drive Auto-Queued (24h Retry)',
+              message: data.queueMessage || 'Link Google Drive bị dính 24h Quota. AriaZero đã TỰ ĐỘNG THÊM VÀO HÀNG CHỜ và sẽ tự động kiểm tra mỗi 30 phút để tải về ngay khi Google mở lại Quota!'
             });
+            return;
           }
         }
       } catch (err) {
@@ -210,30 +271,26 @@ function App() {
 
   // Smart download handler: when a link is detected from clipboard/magnet/drag
   const handleLinkDetected = useCallback((url: string, source?: 'url_param' | 'clipboard' | 'drag') => {
+    const isGDrive = isGoogleDriveUrl(url);
     if (source === 'url_param') {
       setModalInitialUris(url);
       setModalInitialMode('link');
       setShowAddModal(true);
       showToast({
         type: 'info',
-        title: 'Magnet Link Detected',
+        title: isGDrive ? 'Google Drive Link Detected' : 'Magnet Link Detected',
         message: 'Opened download popup',
         duration: 3000,
       });
     } else {
       showToast({
         type: 'info',
-        title: 'Link Detected',
+        title: isGDrive ? 'Google Drive Link Detected' : 'Link Detected',
         message: url.length > 60 ? url.slice(0, 60) + '…' : url,
         action: {
-          label: 'Download Now',
+          label: isGDrive ? 'Tải ngay (Download)' : 'Download Now',
           onClick: () => {
             addUriWithCategory(url);
-            showToast({
-              type: 'success',
-              title: 'Download Started',
-              message: 'Task added to queue',
-            });
           },
         },
         duration: 8000,
@@ -699,7 +756,8 @@ function AppContent({
     setIsClearingAll(true);
     try {
       const completedSeedingTasks = [...activeTasks, ...waitingTasks].filter(t => isTorrentCompleted(t) && !isMetadataTask(t));
-      const allCompletedTasks = [...stoppedTasks, ...completedSeedingTasks];
+      const seedingGids = new Set(completedSeedingTasks.map(t => t.gid));
+      const allCompletedTasks = [...completedSeedingTasks, ...stoppedTasks.filter(t => !seedingGids.has(t.gid))];
 
       const allPaths: string[] = [];
       for (const task of allCompletedTasks) {
@@ -889,7 +947,9 @@ function AppContent({
 
   // Derived state stats calculations memoized
   const allTasks = useMemo(() => {
-    return [...allActiveAndWaiting, ...stoppedTasks].filter((t: Aria2Task) => !isMetadataTask(t));
+    const activeGids = new Set(allActiveAndWaiting.map(t => t.gid));
+    const cleanStopped = stoppedTasks.filter(t => !activeGids.has(t.gid));
+    return [...allActiveAndWaiting, ...cleanStopped].filter((t: Aria2Task) => !isMetadataTask(t));
   }, [allActiveAndWaiting, stoppedTasks]);
 
   const categoryCounts = useMemo(() => {
@@ -902,8 +962,11 @@ function AppContent({
     let doc = 0;
     let software = 0;
 
+    const activeGids = new Set<string>();
+
     allActiveAndWaiting.forEach((t: Aria2Task) => {
       if (isMetadataTask(t)) return;
+      activeGids.add(t.gid);
       if (t.status === 'active' && !isTorrentCompleted(t)) {
         active++;
       }
@@ -914,6 +977,7 @@ function AppContent({
 
     stoppedTasks.forEach((t: Aria2Task) => {
       if (isMetadataTask(t)) return;
+      if (activeGids.has(t.gid)) return; // Avoid counting active seeding torrents twice
       if (t.status === 'complete') {
         completed++;
       } else if (t.status === 'error') {
@@ -952,16 +1016,17 @@ function AppContent({
 
   const handleAddSubmit = async (mode: 'link' | 'torrent', uris: string, torrentFile: { name: string; base64: string } | null) => {
     if (mode === 'link') {
-      if (!uris.trim()) return;
-      const parsedUris = uris.split('\n').map((u: string) => u.trim()).filter((u: string) => u);
+      const parsedUris = parseDownloadUrls(uris);
       for (const uri of parsedUris) {
         try {
           await addUri(uri);
-          showToast({
-            type: 'success',
-            title: 'Download Started',
-            message: 'Task added to queue successfully.'
-          });
+          if (!isGoogleDriveUrl(uri)) {
+            showToast({
+              type: 'success',
+              title: 'Download Started',
+              message: 'Task added to queue successfully.'
+            });
+          }
         } catch (err: any) {
           console.error('Failed to add URI:', err);
           const errMsg = err?.message || err || 'Failed to add task to Aria2.';

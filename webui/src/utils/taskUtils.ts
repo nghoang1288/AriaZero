@@ -155,3 +155,27 @@ export function isGoogleDriveUrl(url: string): boolean {
   return /drive\.google\.com|drive\.usercontent\.google\.com|docs\.google\.com/i.test(url);
 }
 
+export function extractGdriveId(url: string): string | null {
+  if (!url) return null;
+  const match = url.match(/\/file\/d\/([a-zA-Z0-9_-]+)/i) ||
+                url.match(/[?&]id=([a-zA-Z0-9_-]+)/i) ||
+                url.match(/\/document\/d\/([a-zA-Z0-9_-]+)/i) ||
+                url.match(/\/open\?id=([a-zA-Z0-9_-]+)/i) ||
+                url.match(/\/uc\?id=([a-zA-Z0-9_-]+)/i);
+  return match ? match[1] : null;
+}
+
+export function parseDownloadUrls(input: string): string[] {
+  if (!input) return [];
+  const URL_REGEX = /(https?:\/\/[^\s"'<>\(\)]+|ftp:\/\/[^\s"'<>\(\)]+|magnet:\?[^\s"'<>\(\)]+)/gi;
+  const matches = input.match(URL_REGEX);
+  if (matches && matches.length > 0) {
+    const cleaned = matches.map(u => u.replace(/[,\s;]+$/, '').trim()).filter(Boolean);
+    return Array.from(new Set(cleaned));
+  }
+  return Array.from(new Set(
+    input.split(/[\r\n,;]+/).map(u => u.trim()).filter(Boolean)
+  ));
+}
+
+

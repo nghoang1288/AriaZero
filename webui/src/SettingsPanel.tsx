@@ -11,6 +11,7 @@ import {
   AlertCircle,
   Clock,
   Link,
+  HelpCircle,
 } from 'lucide-react';
 import { useToast } from './Toast';
 import { useApiUrl } from './hooks/useApiUrl';
@@ -1114,18 +1115,27 @@ function IntegrationsSection() {
   const [expanded, setExpanded] = useState(false);
   const [jellyfinUrl, setJellyfinUrl] = useState('');
   const [jellyfinApiKey, setJellyfinApiKey] = useState('');
+  const [gdriveAccessToken, setGdriveAccessToken] = useState('');
+  const [gdriveRefreshToken, setGdriveRefreshToken] = useState('');
   const [saving, setSaving] = useState(false);
   const { getApiUrl } = useApiUrl();
   const { showToast } = useToast();
 
   // Load from backend
   useEffect(() => {
-    fetch(`${getApiUrl('settings')}`)
+    const secret = (window as any).AriaZeroServerConfig?.rpcSecret || '';
+    const headers: Record<string, string> = {};
+    if (secret) {
+      headers['Authorization'] = `Bearer ${secret}`;
+    }
+    fetch(`${getApiUrl('settings')}`, { headers })
       .then(res => res.json())
       .then(data => {
         if (data && typeof data === 'object') {
           if (data.jellyfin_url) setJellyfinUrl(data.jellyfin_url);
           if (data.jellyfin_api_key) setJellyfinApiKey(data.jellyfin_api_key);
+          if (data.gdrive_access_token) setGdriveAccessToken(data.gdrive_access_token);
+          if (data.gdrive_refresh_token) setGdriveRefreshToken(data.gdrive_refresh_token);
         }
       })
       .catch(err => console.error("Failed to load settings", err));
@@ -1134,12 +1144,19 @@ function IntegrationsSection() {
   const handleSave = async () => {
     setSaving(true);
     try {
+      const secret = (window as any).AriaZeroServerConfig?.rpcSecret || '';
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (secret) {
+        headers['Authorization'] = `Bearer ${secret}`;
+      }
       const resp = await fetch(`${getApiUrl('settings')}`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({
           jellyfin_url: jellyfinUrl,
-          jellyfin_api_key: jellyfinApiKey
+          jellyfin_api_key: jellyfinApiKey,
+          gdrive_access_token: gdriveAccessToken,
+          gdrive_refresh_token: gdriveRefreshToken
         })
       });
       if (resp.ok) {
@@ -1205,6 +1222,57 @@ function IntegrationsSection() {
                 placeholder="API Key..."
                 value={jellyfinApiKey}
                 onChange={(e) => setJellyfinApiKey(e.target.value)}
+                className="w-full bg-input-bg border border-border-main rounded-lg px-3 py-2 text-xs text-slate-300 focus:outline-none focus:border-cyan-500/70"
+              />
+            </div>
+          </div>
+
+          {/* Google Drive Quota Bypass Section */}
+          <div className="px-5 py-2.5 bg-slate-800/20 border-b border-t border-border-main">
+            <span className="text-xs font-semibold text-cyan-400 uppercase tracking-wider">Google Drive Quota Bypass</span>
+          </div>
+
+          <div className="p-4 bg-cyan-950/20 border border-cyan-500/20 rounded-lg mx-5 my-3 text-xs text-slate-300 space-y-2">
+            <div className="font-semibold text-cyan-400 flex items-center gap-1.5 text-xs">
+              <HelpCircle className="w-4 h-4 text-cyan-400 shrink-0" />
+              <span>Hướng dẫn lấy Google Drive Access Token (OAuth):</span>
+            </div>
+            <ol className="list-decimal list-inside space-y-1.5 text-[11px] text-slate-300 pl-1 leading-relaxed">
+              <li>Truy cập <a href="https://developers.google.com/oauthplayground" target="_blank" rel="noreferrer" className="text-cyan-400 underline hover:text-cyan-300">Google OAuth2 Playground</a>.</li>
+              <li>Ở cột bên trái (Step 1), cuộn xuống chọn <strong>Drive API v3</strong> &rarr; tích chọn <code className="bg-slate-800 text-cyan-300 px-1 py-0.5 rounded">https://www.googleapis.com/auth/drive</code>.</li>
+              <li>Nhấn <strong>Authorize APIs</strong> và đăng nhập tài khoản Google để cấp quyền.</li>
+              <li>Ở Step 2, nhấn <strong>Exchange authorization code for tokens</strong>.</li>
+              <li>Copy ô <strong>Access token</strong> (dạng <code className="bg-slate-800 text-cyan-300 px-1 py-0.5 rounded">ya29.a0...</code>) hoặc ô <strong>Refresh token</strong> (dạng <code className="bg-slate-800 text-cyan-300 px-1 py-0.5 rounded">1//04...</code> bên dưới để sử dụng lâu dài).</li>
+            </ol>
+          </div>
+
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 px-5 py-3.5 hover:bg-slate-800/10 transition-colors">
+            <div className="sm:max-w-[55%]">
+              <span className="text-xs font-semibold text-slate-200 block">Google Drive Access Token (OAuth)</span>
+              <span className="text-[10px] text-slate-500">OAuth Access Token dùng để tự động copy & tải các file Google Drive bị dính 24h Quota Limit (hiệu lực 1h).</span>
+            </div>
+            <div className="w-full sm:w-64">
+              <input
+                type="password"
+                placeholder="ya29.a0..."
+                value={gdriveAccessToken}
+                onChange={(e) => setGdriveAccessToken(e.target.value)}
+                className="w-full bg-input-bg border border-border-main rounded-lg px-3 py-2 text-xs text-slate-300 focus:outline-none focus:border-cyan-500/70"
+              />
+            </div>
+          </div>
+
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 px-5 py-3.5 hover:bg-slate-800/10 transition-colors">
+            <div className="sm:max-w-[55%]">
+              <span className="text-xs font-semibold text-slate-200 block">Google Drive Refresh Token (Tự động gia hạn 24/7)</span>
+              <span className="text-[10px] text-slate-500">Refresh Token từ Google OAuth Playground (dạng 1//04...). AriaZero sẽ tự động gia hạn Access Token mới 100% khi hết hạn.</span>
+            </div>
+            <div className="w-full sm:w-64">
+              <input
+                type="password"
+                placeholder="1//04..."
+                value={gdriveRefreshToken}
+                onChange={(e) => setGdriveRefreshToken(e.target.value)}
                 className="w-full bg-input-bg border border-border-main rounded-lg px-3 py-2 text-xs text-slate-300 focus:outline-none focus:border-cyan-500/70"
               />
             </div>

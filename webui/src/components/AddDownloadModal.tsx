@@ -1,5 +1,6 @@
-import React, { useState, useEffect } from 'react';
-import { X, Upload } from 'lucide-react';
+import React, { useState, useEffect, useMemo } from 'react';
+import { X, Upload, Clipboard, HardDrive } from 'lucide-react';
+import { isGoogleDriveUrl, parseDownloadUrls } from '../utils/taskUtils';
 
 interface AddDownloadModalProps {
   isOpen: boolean;
@@ -24,25 +25,61 @@ export default function AddDownloadModal({
   const [selectedUrls, setSelectedUrls] = useState<Record<string, boolean>>({});
   const [showBatchSelection, setShowBatchSelection] = useState(false);
 
-  // Sync initial values when modal opens
+  // Sync initial values when modal opens & auto-check clipboard if empty
   useEffect(() => {
     if (isOpen) {
       setAddMode(initialMode);
-      setNewUris(initialUris);
       setTorrentFile(null);
       setExtractedUrls([]);
       setSelectedUrls({});
       setShowBatchSelection(false);
+
+      if (initialUris) {
+        setNewUris(initialUris);
+      } else {
+        setNewUris('');
+        // Auto-check clipboard on modal open
+        if (navigator?.clipboard?.readText) {
+          navigator.clipboard.readText().then((text) => {
+            if (text) {
+              const trimmed = text.trim();
+              const urls = parseDownloadUrls(trimmed);
+              if (urls.length > 0) {
+                setNewUris(urls.join('\n'));
+              }
+            }
+          }).catch(() => {
+            // Silently ignore clipboard permission errors
+          });
+        }
+      }
     }
   }, [isOpen, initialMode, initialUris]);
 
+  const handlePasteClipboard = async () => {
+    try {
+      const text = await navigator.clipboard.readText();
+      if (text) {
+        const trimmed = text.trim();
+        const urls = parseDownloadUrls(trimmed);
+        if (urls.length > 0) {
+          setNewUris((prev) => (prev ? `${prev}\n${urls.join('\n')}` : urls.join('\n')));
+        } else {
+          setNewUris((prev) => (prev ? `${prev}\n${trimmed}` : trimmed));
+        }
+      }
+    } catch {
+      // Ignore
+    }
+  };
+
+  const hasGoogleDrive = useMemo(() => isGoogleDriveUrl(newUris), [newUris]);
+  const parsedUrlsCount = useMemo(() => parseDownloadUrls(newUris).length, [newUris]);
+
   if (!isOpen) return null;
 
-  const URL_REGEX = /(https?:\/\/[^\s"'<>\(\)]+|ftp:\/\/[^\s"'<>\(\)]+|magnet:\?[^\s"'<>\(\)]+)/gi;
-
   const extractUrls = () => {
-    const found = newUris.match(URL_REGEX) || [];
-    const unique = Array.from(new Set(found.map(url => url.trim()).filter(url => url)));
+    const unique = parseDownloadUrls(newUris);
     if (unique.length > 0) {
       setExtractedUrls(unique);
       const initialSelected: Record<string, boolean> = {};
@@ -68,7 +105,9 @@ export default function AddDownloadModal({
         if (!finalUris) return;
         onSubmit(addMode, finalUris, null);
       } else {
-        onSubmit(addMode, newUris, torrentFile);
+        const cleaned = parseDownloadUrls(newUris).join('\n');
+        if (!cleaned) return;
+        onSubmit(addMode, cleaned, torrentFile);
       }
     } else {
       onSubmit(addMode, newUris, torrentFile);
@@ -124,7 +163,14 @@ export default function AddDownloadModal({
           <div className="p-5 space-y-4">
             {addMode === 'link' ? (
               <div>
-                <label className="text-xs text-text-dim block mb-1.5">URLs to download</label>
+                <div className="flex items-center justify-between mb-1.5">
+                  <label className="text-xs text-text-dim block">URLs to download</label>
+                  {parsedUrlsCount > 1 && (
+                    <span className="text-[10px] px-2 py-0.5 rounded-full bg-cyan-500/10 text-cyan-400 font-semibold border border-cyan-500/20">
+                      Phát hiện {parsedUrlsCount} liên kết
+                    </span>
+                  )}
+                </div>
                 {!showBatchSelection ? (
                   <>
                     <textarea 
@@ -134,7 +180,16 @@ export default function AddDownloadModal({
                       onChange={(e) => setNewUris(e.target.value)}
                       className="w-full bg-input-bg border border-border-main rounded-lg px-3 py-2 text-xs text-text-main placeholder-text-dim/60 focus:outline-none focus:border-cyan-500 transition-colors"
                     />
-                    <div className="flex justify-end mt-2">
+                    <div className="flex items-center justify-between mt-2">
+                      <button
+                        type="button"
+                        onClick={handlePasteClipboard}
+                        className="inline-flex items-center gap-1.5 text-text-dim hover:text-cyan-400 text-[11px] font-medium transition-colors cursor-pointer"
+                        title="Dán nội dung từ bộ nhớ tạm (Clipboard)"
+                      >
+                        <Clipboard className="w-3.5 h-3.5" />
+                        <span>Dán từ Clipboard</span>
+                      </button>
                       <button
                         type="button"
                         onClick={extractUrls}
@@ -143,6 +198,18 @@ export default function AddDownloadModal({
                         Parse Text for Links
                       </button>
                     </div>
+
+                    {hasGoogleDrive && (
+                      <div className="flex items-start gap-2.5 p-3 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-300 text-xs mt-3">
+                        <HardDrive className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                        <div className="min-w-0">
+                          <span className="font-semibold text-amber-400 block">Đã nhận diện link Google Drive</span>
+                          <span className="text-[11px] text-amber-300/80 leading-relaxed block mt-0.5">
+                            Hệ thống sẽ tự động giải mã tải trực tiếp và tự động xếp vào hàng chờ (Auto 24h Quota Retry) nếu bị quá giới hạn lượt tải!
+                          </span>
+                        </div>
+                      </div>
+                    )}
                   </>
                 ) : (
                   <div className="space-y-3">
