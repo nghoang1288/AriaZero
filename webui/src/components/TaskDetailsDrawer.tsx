@@ -291,6 +291,11 @@ export default function TaskDetailsDrawer({
         [filePath]: data
       }));
       
+      if (hashPollIntervalsRef.current[filePath]) {
+        clearInterval(hashPollIntervalsRef.current[filePath]);
+        delete hashPollIntervalsRef.current[filePath];
+      }
+
       const pollInterval = setInterval(async () => {
         try {
           const statusRes = await fetch(getApiUrl(`file-hash/status?path=${encodeURIComponent(filePath)}`), {

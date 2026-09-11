@@ -97,7 +97,7 @@ declare global {
 
 // Wait for config.js to load (it is injected dynamically)
 function getRpcSecret(): string {
-  return window.AriaZeroServerConfig?.rpcSecret || '';
+  return window.AriaZeroServerConfig?.rpcSecret || localStorage.getItem('ariazero_rpc_secret') || '';
 }
 
 export interface Aria2Event {
@@ -387,6 +387,12 @@ export function useAria2() {
           clearTimeout(pollTimeoutRef.current);
           pollTimeoutRef.current = null;
         }
+
+        // Reject all pending RPC requests to prevent memory leak and hanging promises
+        pendingRequestsRef.current.forEach(({ reject }) => {
+          reject(new Error('WebSocket connection closed'));
+        });
+        pendingRequestsRef.current.clear();
         
         reconnectAttemptsRef.current++;
         const delay = Math.min(1000 * Math.pow(2, reconnectAttemptsRef.current), 30000);

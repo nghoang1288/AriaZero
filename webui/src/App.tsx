@@ -589,6 +589,14 @@ function AppContent({
   const { getApiUrl } = useApiUrl();
 
   const retryCountsRef = useRef<Map<string, number>>(new Map());
+  const retryTimeoutsRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+
+  useEffect(() => {
+    return () => {
+      retryTimeoutsRef.current.forEach(clearTimeout);
+      retryTimeoutsRef.current.clear();
+    };
+  }, []);
 
   // Ref to hold the latest tasks to check for existence during scheduled retries
   const allTasksRef = useRef<Aria2Task[]>([]);
@@ -643,39 +651,16 @@ function AppContent({
   const getPathsToDelete = useCallback((task: Aria2Task): string[] => {
     if (!task.files || task.files.length === 0) return [];
     
-    const protectedFolders = new Set(['movies', 'tv series', 'games', 'video', 'audio', 'documents', 'software']);
-    
-    const paths = task.files
-      .map(f => {
-        let p = f.path;
-        if (!p) return '';
-        if (!p.startsWith('/downloads/') && !p.startsWith('/')) {
-          p = `/downloads/${p}`;
-        }
-        return p;
-      })
-      .filter(p => p && p.startsWith('/downloads/'));
-      
-    if (paths.length === 0) return [];
-    
     const itemsToDelete = new Set<string>();
-    
-    for (const path of paths) {
-      const relative = path.substring('/downloads/'.length);
-      const parts = relative.split(/[/\\]/).filter(Boolean);
-      if (parts.length === 0) continue;
-
-      const firstPartLower = parts[0].toLowerCase();
-      if (protectedFolders.has(firstPartLower)) {
-        if (parts.length >= 2) {
-          const targetPath = `/downloads/${parts[0]}/${parts[1]}`;
-          itemsToDelete.add(targetPath);
-          itemsToDelete.add(`${targetPath}.aria2`);
-        }
-      } else {
-        const topLevelPath = `/downloads/${parts[0]}`;
-        itemsToDelete.add(topLevelPath);
-        itemsToDelete.add(`${topLevelPath}.aria2`);
+    for (const f of task.files) {
+      let p = f.path;
+      if (!p) continue;
+      if (!p.startsWith('/downloads/') && !p.startsWith('/')) {
+        p = `/downloads/${p}`;
+      }
+      if (p.startsWith('/downloads/')) {
+        itemsToDelete.add(p);
+        itemsToDelete.add(`${p}.aria2`);
       }
     }
     
@@ -689,6 +674,11 @@ function AppContent({
 
   const handleConfirmRemove = async () => {
     if (!taskToRemove) return;
+    const tid = retryTimeoutsRef.current.get(taskToRemove.gid);
+    if (tid) {
+      clearTimeout(tid);
+      retryTimeoutsRef.current.delete(taskToRemove.gid);
+    }
     
     setIsDeletingFiles(true);
     try {
@@ -871,27 +861,55 @@ function AppContent({
   useEffect(() => {
     if (events.length === 0) return;
 
+    const getTaskRetryKey = (t: Aria2Task): string => {
+      if (t.infoHash) return `bt:${t.infoHash.toLowerCase()}`;
+      const uri = t.files?.[0]?.uris?.[0]?.uri;
+      if (uri) return `url:${uri.split('?')[0]}`;
+      const btName = t.bittorrent?.info?.name;
+      if (btName) return `btname:${btName.toLowerCase()}`;
+      return `name:${getTaskName(t).toLowerCase()}`;
+    };
+
     for (const event of events) {
       if (event.type === 'complete') {
         const completedTask = [...activeTasks, ...waitingTasks, ...stoppedTasks].find(t => t.gid === event.gid);
-        const taskName = completedTask ? getTaskName(completedTask) : event.gid;
+        const taskName = completedTask ? getTaskName(completedTask) : '';
 
-        showToast({
-          type: 'success',
-          title: 'Download Complete',
-          message: `Task "${taskName}" finished successfully`,
-        });
-
-        const soundEnabled = localStorage.getItem('ariazero_sound_enabled') !== 'false';
-        if (soundEnabled) {
-          playNotificationBeep();
+        if (completedTask) {
+          retryCountsRef.current.delete(getTaskRetryKey(completedTask));
+        }
+        const existingTid = retryTimeoutsRef.current.get(event.gid);
+        if (existingTid) {
+          clearTimeout(existingTid);
+          retryTimeoutsRef.current.delete(event.gid);
         }
 
-        if (Notification.permission === 'granted') {
-          new Notification('AriaZero — Download Complete', {
-            body: `Task "${taskName}" finished`,
-            icon: '/favicon.ico',
+        // Only show notifications for genuine completed downloads:
+        // Ignore if task is not found, or is a metadata download, or is an empty/bogus small task (<5MB for video)
+        const isBogusOrMetadata = !completedTask || 
+          isMetadataTask(completedTask) || 
+          !taskName ||
+          taskName === event.gid ||
+          (Number(completedTask.totalLength) < 5 * 1024 * 1024 && isVideo(getFileExtension(taskName)));
+
+        if (!isBogusOrMetadata) {
+          showToast({
+            type: 'success',
+            title: 'Download Complete',
+            message: `Task "${taskName}" finished successfully`,
           });
+
+          const soundEnabled = localStorage.getItem('ariazero_sound_enabled') !== 'false';
+          if (soundEnabled) {
+            playNotificationBeep();
+          }
+
+          if (Notification.permission === 'granted') {
+            new Notification('AriaZero — Download Complete', {
+              body: `Task "${taskName}" finished`,
+              icon: '/favicon.ico',
+            });
+          }
         }
       } else if (event.type === 'error') {
         const autoRetryEnabled = localStorage.getItem('ariazero_auto_retry_enabled') !== 'false';
@@ -899,9 +917,7 @@ function AppContent({
         const retryDelaySec = Number(localStorage.getItem('ariazero_auto_retry_delay') || '5');
 
         const failedTask = [...activeTasks, ...waitingTasks, ...stoppedTasks].find(t => t.gid === event.gid);
-        const retryKey = failedTask 
-          ? (failedTask.files?.[0]?.uris?.[0]?.uri || failedTask.bittorrent?.info?.name || getTaskName(failedTask))
-          : event.gid;
+        const retryKey = failedTask ? getTaskRetryKey(failedTask) : `gid:${event.gid}`;
 
         const currentRetryCount = retryCountsRef.current.get(retryKey) || 0;
 
@@ -917,7 +933,8 @@ function AppContent({
               duration: retryDelaySec * 1000
             });
 
-            setTimeout(() => {
+            const tid = setTimeout(() => {
+              retryTimeoutsRef.current.delete(event.gid);
               const taskStillExists = allTasksRef.current.some(t => t.gid === event.gid);
               if (taskStillExists) {
                 retryTask(failedTask);
@@ -925,6 +942,7 @@ function AppContent({
                 console.log(`Task ${event.gid} was deleted by user during retry delay. Skipping retry.`);
               }
             }, retryDelaySec * 1000);
+            retryTimeoutsRef.current.set(event.gid, tid);
           } else {
             showToast({
               type: 'error',

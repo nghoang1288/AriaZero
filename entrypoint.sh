@@ -80,6 +80,13 @@ window.AriaZeroServerConfig = {
 };
 EOF
 
+# Optional HTTP Basic Auth for Nginx
+if [ -n "$BASIC_AUTH_USER" ] && [ -n "$BASIC_AUTH_PASSWORD" ]; then
+    echo "Configuring Nginx HTTP Basic Auth for user $BASIC_AUTH_USER..."
+    python3 -c "import hashlib, base64; print('${BASIC_AUTH_USER}:{SHA}' + base64.b64encode(hashlib.sha1('${BASIC_AUTH_PASSWORD}'.encode('utf-8')).digest()).decode('utf-8'))" > /etc/nginx/.htpasswd
+    sed -i '/auth_basic/d' /etc/nginx/sites-available/default
+    sed -i '/server_name _;/a \    auth_basic "AriaZero Restricted Area";\n    auth_basic_user_file /etc/nginx/.htpasswd;' /etc/nginx/sites-available/default
+fi
 
 # Set up Samba configuration
 SMB_CONF="/etc/samba/smb.conf"

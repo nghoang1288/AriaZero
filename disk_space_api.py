@@ -1,7 +1,9 @@
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import re
-import html
+import html as html_lib
+from html import unescape as html_unescape
+import base64
 import shutil
 import os
 import sqlite3
@@ -89,10 +91,24 @@ def init_db():
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_dh_completed_time ON download_history(completed_time DESC)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_dh_name ON download_history(name)')
         # Clean up any leftover metadata items or bogus html files from history
-        cursor.execute("DELETE FROM download_history WHERE name LIKE '[METADATA]%' OR name LIKE 'metadata%' OR name = 'download'")
+        cursor.execute("DELETE FROM download_history WHERE name LIKE '[METADATA]%' OR name LIKE 'metadata%' OR name = 'download' OR (total_length < 5242880 AND (name LIKE '%.mkv' OR name LIKE '%.mp4' OR name LIKE '%.avi' OR name LIKE '%.mov'))")
+        # Reset any gdrive_retry_queue items that were mistakenly marked as completed for bogus HTML downloads
+        cursor.execute('''
+            UPDATE gdrive_retry_queue 
+            SET status = 'pending', error = 'Google Drive Quota Exceeded: File has been downloaded too many times recently.'
+            WHERE status IN ('completed', 'downloading') 
+              AND filename NOT IN (SELECT name FROM download_history WHERE status = 'complete' AND total_length >= 5242880)
+        ''')
         conn.commit()
     finally:
         conn.close()
+
+    # Purge aria2 stopped results from memory
+    try:
+        call_aria2_rpc("aria2.purgeDownloadResult", [])
+        call_aria2_rpc("aria2.saveSession", [])
+    except Exception:
+        pass
 
     try:
         if os.path.exists("/downloads/download"):
@@ -100,11 +116,49 @@ def init_db():
     except Exception:
         pass
     
+    # Automatically clean up any bogus HTML media files (<5MB) from disk
+    try:
+        cleanup_bogus_files_on_disk()
+    except Exception as e:
+        print(f"Error running cleanup_bogus_files_on_disk: {e}")
+
     # Automatically scan existing downloaded files on disk once if needed
     try:
         sync_existing_files_to_history()
     except Exception as e:
         print(f"Error running initial sync_existing_files_to_history: {e}")
+
+def cleanup_bogus_files_on_disk():
+    base_dir = "/downloads"
+    if not os.path.exists(base_dir):
+        return
+    media_exts = {'.mkv', '.mp4', '.avi', '.mov', '.iso', '.wmv', '.flv', '.webm'}
+    try:
+        for root, dirs, files in os.walk(base_dir):
+            for file in files:
+                ext = os.path.splitext(file)[1].lower()
+                if ext in media_exts:
+                    full_path = os.path.join(root, file)
+                    try:
+                        if os.path.getsize(full_path) < 5 * 1024 * 1024:
+                            with open(full_path, 'rb') as f:
+                                hdr = f.read(1024).lower()
+                            if b'<!doctype html' in hdr or b'<html' in hdr or b'quota exceeded' in hdr or b'sorry, you can' in hdr:
+                                print(f"[Cleanup] Removing bogus HTML media file: {full_path}")
+                                os.remove(full_path)
+                                # Remove accompanying metadata files (posters, nfo, etc.)
+                                base_name = os.path.splitext(file)[0]
+                                for sibling in os.listdir(root):
+                                    if sibling.startswith(base_name) and sibling != file:
+                                        try:
+                                            os.remove(os.path.join(root, sibling))
+                                            print(f"[Cleanup] Removing associated metadata: {sibling}")
+                                        except Exception:
+                                            pass
+                    except Exception as fe:
+                        print(f"[Cleanup] Error checking {full_path}: {fe}")
+    except Exception as e:
+        print(f"[Cleanup] Error in cleanup_bogus_files_on_disk: {e}")
 
 def sync_existing_files_to_history():
     """Scans download directories on disk and automatically adds any completed files to download_history if not already present or dismissed."""
@@ -376,9 +430,44 @@ def upsert_history_records(tasks):
             elif status not in ('complete', 'error', 'removed'):
                 # For non-stopped/incomplete tasks, do not add to persistent history unless complete
                 continue
-                
-            error_code = task.get('errorCode')
-            error_message = task.get('errorMessage')
+
+            # Check if this task is an HTML error page pretending to be a media file (e.g. 2KB Google Drive Quota HTML)
+            is_bogus = False
+            files_list = task.get('files', [])
+            media_exts = {'.mkv', '.mp4', '.avi', '.mov', '.iso', '.wmv', '.flv', '.webm'}
+            for f in files_list:
+                f_path = f.get('path') or ''
+                ext = os.path.splitext(f_path)[1].lower() if f_path else os.path.splitext(name)[1].lower()
+                if ext in media_exts and total_length < 5 * 1024 * 1024:
+                    is_bogus = True
+                    if f_path and os.path.exists(f_path):
+                        try:
+                            os.remove(f_path)
+                            print(f"[Aria2 Monitor] Removed bogus download file: {f_path}")
+                            base_name = os.path.splitext(os.path.basename(f_path))[0]
+                            p_dir = os.path.dirname(f_path)
+                            for sib in os.listdir(p_dir):
+                                if sib.startswith(base_name) and sib != os.path.basename(f_path):
+                                    try:
+                                        os.remove(os.path.join(p_dir, sib))
+                                    except Exception:
+                                        pass
+                        except Exception as err_rem:
+                            print(f"Error removing bogus file: {err_rem}")
+                    break
+
+            if is_bogus:
+                # Remove from aria2 memory so it doesn't loop forever
+                call_aria2_rpc("aria2.removeDownloadResult", [gid])
+                # Remove from download_history
+                cursor.execute("DELETE FROM download_history WHERE gid = ? OR name = ?", (gid, name))
+                # Reset queue item to pending
+                error_message = 'Google Drive trả về trang lỗi Quota HTML (2 KB) thay vì file video thực tế'
+                try:
+                    cursor.execute("UPDATE gdrive_retry_queue SET status = 'pending', error = ? WHERE filename = ? OR filename LIKE ?", (error_message, name, f"%{name}%"))
+                except Exception:
+                    pass
+                continue
             files_json = json.dumps(task.get('files', []))
             bittorrent_json = json.dumps(task.get('bittorrent', {}))
             
@@ -404,6 +493,10 @@ def upsert_history_records(tasks):
             
             # Check if newly completed
             if status == 'complete' and old_status != 'complete':
+                try:
+                    cursor.execute("UPDATE gdrive_retry_queue SET status = 'completed', error = NULL WHERE filename = ? OR filename LIKE ?", (name, f"%{name}%"))
+                except Exception:
+                    pass
                 threading.Thread(target=trigger_jellyfin_refresh, daemon=True).start()
 
         conn.commit()
@@ -586,8 +679,8 @@ def background_poller():
                 cleanup_counter = 0
                 cleanup_orphaned_aria2_files()
                 cleanup_old_hash_jobs()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[Aria2 Poller] Error in background polling cycle: {e}")
             
         time.sleep(2)
 
@@ -1027,7 +1120,6 @@ def resolve_jackett_torrent_link(url):
                 if text_start.startswith('magnet:'):
                     return {"magnetUri": text_start.strip()}
                 
-                import base64
                 b64 = base64.b64encode(content).decode('utf-8')
                 return {"base64": b64}
         except urllib.error.HTTPError as e:
@@ -1063,12 +1155,12 @@ def extract_filename_from_cd(disp):
         return urllib.parse.unquote(match.group(1).strip('"\''))
     return None
 
-def extract_filename_from_html(html):
-    match = re.search(r'class="uc-name-size"[^>]*><a[^>]*>([^<]+)</a>', html) or \
-            re.search(r'class="uc-name-size"[^>]*>([^<]+)<', html) or \
-            re.search(r'<span[^>]+id="uc-text"[^>]*>([^<]+)</span>', html)
+def extract_filename_from_html(html_str):
+    match = re.search(r'class="uc-name-size"[^>]*><a[^>]*>([^<]+)</a>', html_str) or \
+            re.search(r'class="uc-name-size"[^>]*>([^<]+)<', html_str) or \
+            re.search(r'<span[^>]+id="uc-text"[^>]*>([^<]+)</span>', html_str)
     if match:
-        return html.unescape(match.group(1).strip())
+        return html_unescape(match.group(1).strip())
     return None
 
 def cleanup_gdrive_copy_later(copy_id, access_token, delay_seconds=7200):
@@ -1228,24 +1320,25 @@ def resolve_gdrive_download(url):
             if not confirm_url:
                 confirm_url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm=t"
 
-            # Verify confirm URL to ensure it doesn't return Quota Exceeded or HTML error page
+            # Verify confirm URL strictly to ensure it doesn't return Quota Exceeded or HTML error page
             try:
                 verify_req = urllib.request.Request(confirm_url, headers=headers)
-                with opener.open(verify_req, timeout=15) as verify_resp:
-                    v_ct = verify_resp.headers.get('Content-Type', '')
-                    if 'text/html' in v_ct.lower():
-                        v_html = verify_resp.read().decode('utf-8', errors='ignore')
-                        if 'Quota exceeded' in v_html or 'too many users' in v_html.lower() or 'downloadQuotaExceeded' in v_html:
+                with opener.open(verify_req, timeout=12) as verify_resp:
+                    v_ct = verify_resp.headers.get('Content-Type', '').lower()
+                    v_chunk = verify_resp.read(8192)
+                    v_html = v_chunk.decode('utf-8', errors='ignore')
+                    if 'text/html' in v_ct or '<!doctype html' in v_html.lower() or '<html' in v_html.lower() or 'quota exceeded' in v_html.lower() or 'sorry, you can' in v_html.lower():
+                        if 'quota exceeded' in v_html.lower() or 'too many users' in v_html.lower() or 'downloadquotaexceeded' in v_html.lower():
                             if access_token:
                                 api_res = gdrive_api_copy_and_download(file_id, access_token)
                                 if api_res and "directUrl" in api_res:
                                     return api_res
                             return {"error": "Google Drive Quota Exceeded: File has been downloaded too many times recently. Please configure Google Drive Access Token in Settings to enable automated API copy bypass."}
-                        if 'permission to download' in v_html or "hasn't given you permission" in v_html or "haven't given you permission" in v_html or "Can't download file" in v_html:
+                        if 'permission to download' in v_html.lower() or "hasn't given you permission" in v_html.lower() or "haven't given you permission" in v_html.lower() or "can't download file" in v_html.lower():
                             return {"error": "Chủ sở hữu file Google Drive này đã khóa quyền tải về (Chỉ cho phép xem, đã tắt tính năng cho phép người xem tải xuống)."}
-                        if 'You need access' in v_html or 'You need permission' in v_html or 'access-denied' in v_html:
+                        if 'you need access' in v_html.lower() or 'you need permission' in v_html.lower() or 'access-denied' in v_html.lower():
                             return {"error": "Google Drive Access Denied: File này ở chế độ riêng tư hoặc cần quyền truy cập."}
-                        if 'File does not exist' in v_html or 'Item has been deleted' in v_html:
+                        if 'file does not exist' in v_html.lower() or 'item has been deleted' in v_html.lower():
                             return {"error": "Google Drive Error: File không tồn tại hoặc đã bị xóa."}
                         return {"error": "Google Drive trả về trang web HTML thay vì file dữ liệu (Không thể tải về trực tiếp)."}
             except urllib.error.HTTPError as he:
@@ -1255,7 +1348,7 @@ def resolve_gdrive_download(url):
                     return {"error": "Google Drive 404: File không tồn tại hoặc đã bị xóa."}
                 return {"error": f"Google Drive HTTP Error {he.code}: {he.reason}"}
             except Exception as e_v:
-                pass
+                return {"error": f"Không thể xác thực link tải Google Drive (lỗi kết nối hoặc hết hạn): {str(e_v)}"}
 
             return {
                 "directUrl": confirm_url,
@@ -1280,12 +1373,12 @@ def get_public_gdrive_filename(file_id):
         uc_url = f"https://drive.google.com/uc?id={file_id}&export=download"
         req = urllib.request.Request(uc_url, headers=headers)
         with urllib.request.urlopen(req, timeout=8) as resp:
-            html = resp.read().decode('utf-8', errors='ignore')
-            m = re.search(r'class="uc-name-size"[^>]*><a[^>]*>([^<]+)</a>', html) or \
-                re.search(r'class="uc-name-size"[^>]*>([^<]+)<', html) or \
-                re.search(r'<span[^>]+id="uc-text"[^>]*>([^<]+)</span>', html)
+            uc_html = resp.read().decode('utf-8', errors='ignore')
+            m = re.search(r'class="uc-name-size"[^>]*><a[^>]*>([^<]+)</a>', uc_html) or \
+                re.search(r'class="uc-name-size"[^>]*>([^<]+)<', uc_html) or \
+                re.search(r'<span[^>]+id="uc-text"[^>]*>([^<]+)</span>', uc_html)
             if m:
-                return html.unescape(urllib.parse.unquote(m.group(1).strip()))
+                return html_unescape(urllib.parse.unquote(m.group(1).strip()))
     except Exception:
         pass
 
@@ -1296,12 +1389,12 @@ def get_public_gdrive_filename(file_id):
             html_text = resp.read().decode('utf-8', errors='ignore')
             m = re.search(r'<meta property="og:title" content="([^"]+)">', html_text)
             if m:
-                name = html.unescape(urllib.parse.unquote(m.group(1).strip()))
+                name = html_unescape(urllib.parse.unquote(m.group(1).strip()))
                 if name and not name.lower().startswith('google drive'):
                     return name
             t = re.search(r'<title>([^<]+)</title>', html_text)
             if t:
-                title = html.unescape(urllib.parse.unquote(t.group(1).replace(' - Google Drive', '').strip()))
+                title = html_unescape(urllib.parse.unquote(t.group(1).replace(' - Google Drive', '').strip()))
                 if title and not title.lower().startswith('google drive'):
                     return title
     except Exception:
@@ -1390,7 +1483,7 @@ def retry_gdrive_queue_item(qid):
                 header_str = f"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\n{res['authHeader']}"
             fn = res.get("filename") or row["filename"]
             gid = send_to_aria2(res["directUrl"], filename=fn, header_str=header_str)
-            cursor.execute("UPDATE gdrive_retry_queue SET status = 'completed', last_tried = ?, error = NULL WHERE id = ?", (now_ts, row["id"]))
+            cursor.execute("UPDATE gdrive_retry_queue SET status = 'downloading', last_tried = ?, error = NULL WHERE id = ?", (now_ts, row["id"]))
             conn.commit()
             return {"success": True, "downloadStarted": True, "gid": gid}
         else:
@@ -1462,18 +1555,23 @@ def gdrive_queue_poller():
                     gid = send_to_aria2(res["directUrl"], filename=fn, header_str=header_str)
                     
                     conn = get_db_connection()
-                    cursor = conn.cursor()
-                    cursor.execute("UPDATE gdrive_retry_queue SET status = 'completed', last_tried = ?, error = NULL WHERE id = ?", (now_ts, qid))
-                    conn.commit()
-                    conn.close()
+                    try:
+                        cursor = conn.cursor()
+                        cursor.execute("UPDATE gdrive_retry_queue SET status = 'downloading', last_tried = ?, error = NULL WHERE id = ?", (now_ts, qid))
+                        conn.commit()
+                    finally:
+                        conn.close()
                     print(f"[GDrive Auto-Queue] Successfully resolved & started download for {g_url} (GID: {gid})")
                 else:
                     err_text = res.get("error", "Quota limit still active") if isinstance(res, dict) else "Unknown error"
                     conn = get_db_connection()
-                    cursor = conn.cursor()
-                    cursor.execute("UPDATE gdrive_retry_queue SET attempts = attempts + 1, last_tried = ?, error = ? WHERE id = ?", (now_ts, err_text, qid))
-                    conn.commit()
-                    conn.close()
+                    try:
+                        cursor = conn.cursor()
+                        cursor.execute("UPDATE gdrive_retry_queue SET attempts = attempts + 1, last_tried = ?, error = ? WHERE id = ?", (now_ts, err_text, qid))
+                        conn.commit()
+                    finally:
+                        conn.close()
+                time.sleep(2)
         except Exception as e:
             print(f"[GDrive Auto-Queue] Error in poller: {e}")
 
