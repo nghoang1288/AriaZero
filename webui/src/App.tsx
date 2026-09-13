@@ -105,13 +105,19 @@ function App() {
     localStorage.setItem('ariazero_theme', next);
   };
 
+  // Refs to avoid stale closures in addUriWithCategory callback
+  const activeTasksRef = useRef<Aria2Task[]>([]);
+  const stoppedTasksRef = useRef<Aria2Task[]>([]);
+  useEffect(() => { activeTasksRef.current = [...activeTasks, ...waitingTasks]; }, [activeTasks, waitingTasks]);
+  useEffect(() => { stoppedTasksRef.current = stoppedTasks; }, [stoppedTasks]);
+
   // Wrap addUri with auto-categorization and Google Drive resolution
   const addUriWithCategory = useCallback(async (uri: string, options?: Record<string, string>) => {
     const sanitizedUri = sanitizeMagnetLink(uri);
 
     // 1. Check if link is already active or waiting in Aria2
     const gdriveId = isGoogleDriveUrl(sanitizedUri) ? extractGdriveId(sanitizedUri) : null;
-    const isAlreadyActive = allActiveAndWaiting.some(t => {
+    const isAlreadyActive = activeTasksRef.current.some(t => {
       return t.files?.some(f => f.uris?.some(u => {
         const cleanU = u.uri.replace(/[,\s;]+$/, '').trim();
         if (cleanU === sanitizedUri) return true;
@@ -129,7 +135,7 @@ function App() {
     }
 
     // 2. Check if already completed in stoppedTasks
-    const isAlreadyCompleted = stoppedTasks.some(t => {
+    const isAlreadyCompleted = stoppedTasksRef.current.some(t => {
       if (t.status !== 'complete') return false;
       return t.files?.some(f => f.uris?.some(u => {
         const cleanU = u.uri.replace(/[,\s;]+$/, '').trim();
@@ -156,7 +162,7 @@ function App() {
       });
       try {
         const resolveUrl = `${getApiUrl('resolve-gdrive')}?url=${encodeURIComponent(sanitizedUri)}`;
-        const secret = (window as any).AriaZeroServerConfig?.rpcSecret || '';
+        const secret = window.AriaZeroServerConfig?.rpcSecret || '';
         const headers: Record<string, string> = {};
         if (secret) {
           headers['Authorization'] = `Bearer ${secret}`;
@@ -397,9 +403,19 @@ function App() {
     // Listen for scheduler change events from the SettingsPanel
     window.addEventListener('ariazero_scheduler_changed', handleConfigChange);
 
+    // Force check when tab wakes up from sleep/background
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        loadConfig();
+        checkScheduler();
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibility);
+
     return () => {
       clearInterval(timer);
       window.removeEventListener('ariazero_scheduler_changed', handleConfigChange);
+      document.removeEventListener('visibilitychange', handleVisibility);
     };
   }, [updateGlobalOptions, showToast]);
 
@@ -616,7 +632,7 @@ function AppContent({
   const fetchDiskSpace = useCallback(async () => {
     try {
       const url = getApiUrl('disk');
-      const secret = (window as any).AriaZeroServerConfig?.rpcSecret || '';
+      const secret = window.AriaZeroServerConfig?.rpcSecret || '';
       const headers: Record<string, string> = {};
       if (secret) {
         headers['Authorization'] = `Bearer ${secret}`;
@@ -688,7 +704,7 @@ function AppContent({
         
       if (paths.length > 0) {
         const url = getApiUrl('delete-files');
-        const secret = (window as any).AriaZeroServerConfig?.rpcSecret || '';
+        const secret = window.AriaZeroServerConfig?.rpcSecret || '';
         const headers: Record<string, string> = { 'Content-Type': 'application/json' };
         if (secret) {
           headers['Authorization'] = `Bearer ${secret}`;
@@ -761,7 +777,7 @@ function AppContent({
       
       if (allPaths.length > 0) {
         const url = getApiUrl('delete-files');
-        const secret = (window as any).AriaZeroServerConfig?.rpcSecret || '';
+        const secret = window.AriaZeroServerConfig?.rpcSecret || '';
         const headers: Record<string, string> = { 'Content-Type': 'application/json' };
         if (secret) {
           headers['Authorization'] = `Bearer ${secret}`;
@@ -820,7 +836,7 @@ function AppContent({
       if (aria2Paths.length > 0) {
         try {
           const apiUrl = getApiUrl('delete-files');
-          const secret = (window as any).AriaZeroServerConfig?.rpcSecret || '';
+          const secret = window.AriaZeroServerConfig?.rpcSecret || '';
           const headers: Record<string, string> = { 'Content-Type': 'application/json' };
           if (secret) {
             headers['Authorization'] = `Bearer ${secret}`;
@@ -1198,9 +1214,9 @@ function AppContent({
           <div className="text-[11px] text-text-dim font-mono break-all bg-page-bg/60 p-2 rounded border border-border-main space-y-1">
             <div>\\{window.location.hostname}\downloads</div>
             <div className="flex items-center justify-between text-[9px] text-text-dim/80 mt-1">
-              <span>User: {(window as any).AriaZeroServerConfig?.smbUser || 'admin'}</span>
+              <span>User: {window.AriaZeroServerConfig?.smbUser || 'admin'}</span>
               <span className="flex items-center gap-1">
-                <span>Pass: {showSambaPass ? ((window as any).AriaZeroServerConfig?.smbPassword || '123456') : '••••••'}</span>
+                <span>Pass: {showSambaPass ? (window.AriaZeroServerConfig?.smbPassword || '123456') : '••••••'}</span>
                 <button
                   type="button"
                   onClick={() => setShowSambaPass(!showSambaPass)}

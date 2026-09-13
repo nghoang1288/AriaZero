@@ -266,7 +266,7 @@ export default function TaskDetailsDrawer({
     }));
     
     try {
-      const secret = (window as any).AriaZeroServerConfig?.rpcSecret || '';
+      const secret = window.AriaZeroServerConfig?.rpcSecret || '';
       const headers: Record<string, string> = {
         'Content-Type': 'application/json'
       };

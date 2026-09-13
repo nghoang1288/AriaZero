@@ -1,0 +1,17 @@
+.git
+.github
+.agents
+node_modules
+webui/node_modules
+dist
+webui/dist
+*.db
+*.pyc
+__pycache__
+deploy_local.py
+inspect_and_deploy.py
+setup_repo.ps1
+.idea
+.vscode
+*.zip
+scratch

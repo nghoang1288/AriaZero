@@ -1123,7 +1123,7 @@ function IntegrationsSection() {
 
   // Load from backend
   useEffect(() => {
-    const secret = (window as any).AriaZeroServerConfig?.rpcSecret || '';
+    const secret = window.AriaZeroServerConfig?.rpcSecret || '';
     const headers: Record<string, string> = {};
     if (secret) {
       headers['Authorization'] = `Bearer ${secret}`;
@@ -1144,7 +1144,7 @@ function IntegrationsSection() {
   const handleSave = async () => {
     setSaving(true);
     try {
-      const secret = (window as any).AriaZeroServerConfig?.rpcSecret || '';
+      const secret = window.AriaZeroServerConfig?.rpcSecret || '';
       const headers: Record<string, string> = { 'Content-Type': 'application/json' };
       if (secret) {
         headers['Authorization'] = `Bearer ${secret}`;

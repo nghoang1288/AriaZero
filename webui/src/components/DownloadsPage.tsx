@@ -67,7 +67,7 @@ export default function DownloadsPage({
 
   const fetchGDriveQueue = useCallback(async () => {
     try {
-      const secret = (window as any).AriaZeroServerConfig?.rpcSecret || '';
+      const secret = window.AriaZeroServerConfig?.rpcSecret || '';
       const headers: Record<string, string> = {};
       if (secret) headers['Authorization'] = `Bearer ${secret}`;
       const res = await fetch(getApiUrl('gdrive-queue'), { headers });
@@ -90,7 +90,7 @@ export default function DownloadsPage({
 
   const handleRetryQueueItem = async (id: number) => {
     try {
-      const secret = (window as any).AriaZeroServerConfig?.rpcSecret || '';
+      const secret = window.AriaZeroServerConfig?.rpcSecret || '';
       const headers: Record<string, string> = { 'Content-Type': 'application/json' };
       if (secret) headers['Authorization'] = `Bearer ${secret}`;
       const res = await fetch(getApiUrl('gdrive-queue/retry'), {
@@ -113,7 +113,7 @@ export default function DownloadsPage({
 
   const handleDeleteQueueItem = async (id: number) => {
     try {
-      const secret = (window as any).AriaZeroServerConfig?.rpcSecret || '';
+      const secret = window.AriaZeroServerConfig?.rpcSecret || '';
       const headers: Record<string, string> = { 'Content-Type': 'application/json' };
       if (secret) headers['Authorization'] = `Bearer ${secret}`;
       await fetch(getApiUrl('gdrive-queue/delete'), {

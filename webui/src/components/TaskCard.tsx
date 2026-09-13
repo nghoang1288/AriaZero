@@ -14,7 +14,7 @@ interface TaskCardProps {
   onContextMenu?: (e: React.MouseEvent, task: Aria2Task) => void;
 }
 
-const TaskCard = memo(function TaskCard({
+function TaskCardInner({
   task,
   onPause,
   onResume,
@@ -127,6 +127,17 @@ const TaskCard = memo(function TaskCard({
       </div>
     </div>
   );
+}
+
+const TaskCard = memo(TaskCardInner, (prev, next) => {
+  if (prev.isSelected !== next.isSelected) return false;
+  if (prev.task.gid !== next.task.gid) return false;
+  if (prev.task.status !== next.task.status) return false;
+  if (prev.task.completedLength !== next.task.completedLength) return false;
+  if (prev.task.downloadSpeed !== next.task.downloadSpeed) return false;
+  if (prev.task.uploadSpeed !== next.task.uploadSpeed) return false;
+  if (prev.task.totalLength !== next.task.totalLength) return false;
+  return true;
 });
 
 export default TaskCard;

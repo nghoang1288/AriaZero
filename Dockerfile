@@ -69,8 +69,7 @@ COPY --from=aria2-builder /tmp/aria2/bin/aria2c /usr/local/bin/aria2c
 RUN chmod +x /usr/local/bin/aria2c
 
 # Copy Jackett from builder stage
-COPY --from=jackett-builder /opt/jackett /opt/opt_jackett_temp
-RUN mv /opt/opt_jackett_temp /opt/jackett
+COPY --from=jackett-builder /opt/jackett /opt/jackett
 
 # Remove default nginx pages and copy the compiled AriaZero React frontend
 RUN rm -rf /var/www/html/*
@@ -87,7 +86,8 @@ RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/disk_space_api.py
 # 80: AriaZero WebUI (Nginx)
 # 6800: Aria2 RPC (Direct access if needed)
 # 445: SMB Server (Samba)
-EXPOSE 80 6800 445
+# 6881: BitTorrent peer port (TCP/UDP)
+EXPOSE 80 6800 445 6881 6881/udp
 
 # Volumes for config and downloads
 VOLUME ["/config", "/downloads"]

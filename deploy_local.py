@@ -6,19 +6,23 @@ import sys
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
 
-hostname = "192.168.50.226"
-username = "illusion88"
-password = "armageddon"
+hostname = os.environ.get("DEPLOY_HOST", "192.168.50.226")
+username = os.environ.get("DEPLOY_USER", "illusion88")
+password = os.environ.get("DEPLOY_PASSWORD", "armageddon")
+rpc_secret = os.environ.get("ARIA2_RPC_SECRET", "armageddon")
 remote_dir = "/home/illusion88/ariazero_temp"
 local_dir = "e:/Code linh tinh/ariazero"
 
-def run_ssh_cmd(ssh, cmd):
+def run_ssh_cmd(ssh, cmd, check=False):
     print(f"Executing: {cmd}")
     stdin, stdout, stderr = ssh.exec_command(cmd)
     stdin.write(password + '\n')
     stdin.flush()
     out = stdout.read().decode('utf-8', errors='replace')
     err = stderr.read().decode('utf-8', errors='replace')
+    exit_status = stdout.channel.recv_exit_status()
+    if check and exit_status != 0:
+        raise RuntimeError(f"Command failed with exit status {exit_status}:\n{err or out}")
     return out, err
 
 try:
@@ -77,7 +81,7 @@ try:
 
     # 4. Build Docker image on the remote host
     print("Building Docker image on remote server (this may take a minute)...")
-    out, err = run_ssh_cmd(ssh, f"sudo -S docker -H tcp://127.0.0.1:2375 build -t illusion1208/ariazero:latest {remote_dir}")
+    out, err = run_ssh_cmd(ssh, f"sudo -S docker -H tcp://127.0.0.1:2375 build -t illusion1208/ariazero:latest {remote_dir}", check=True)
     print(out)
     if "Error" in err or "failed" in err.lower():
         print(f"Build Error Stderr: {err}")
@@ -105,7 +109,7 @@ try:
         "-p 6881:6881/udp "
         "-v /home/illusion88/aria2/config:/config "
         "-v /home/illusion88/aria2/downloads:/downloads "
-        "-e ARIA2_RPC_SECRET=armageddon "
+        f"-e ARIA2_RPC_SECRET={rpc_secret} "
         "--restart unless-stopped "
         "illusion1208/ariazero:latest"
     )

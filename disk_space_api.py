@@ -24,11 +24,10 @@ OMDB_CACHE_TTL = 604800  # 7 days in seconds
 hash_jobs = {}
 hash_jobs_lock = threading.Lock()
 
-# Blocklist of GIDs that have been explicitly deleted by the user.
-# The background poller checks this set and skips these GIDs to prevent
-# re-inserting them into SQLite before aria2 finishes processing the removal.
-_deleted_gids = set()
+# Stores (gid, timestamp) — entries expire after 120 seconds to prevent memory leak
+_deleted_gids = {}  # {gid: timestamp}
 _deleted_gids_lock = threading.Lock()
+_DELETED_GID_TTL = 120  # seconds
 
 def init_db():
     db_dir = os.path.dirname(DB_PATH)
@@ -90,8 +89,8 @@ def init_db():
         ''')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_dh_completed_time ON download_history(completed_time DESC)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_dh_name ON download_history(name)')
-        # Clean up any leftover metadata items or bogus html files from history
-        cursor.execute("DELETE FROM download_history WHERE name LIKE '[METADATA]%' OR name LIKE 'metadata%' OR name = 'download' OR (total_length < 5242880 AND (name LIKE '%.mkv' OR name LIKE '%.mp4' OR name LIKE '%.avi' OR name LIKE '%.mov'))")
+        # Preserve dismissed_history across restarts so user dismissals are respected
+        # sync_existing_files_to_history() will still index any missing genuine files on disk
         # Reset any gdrive_retry_queue items that were mistakenly marked as completed for bogus HTML downloads
         cursor.execute('''
             UPDATE gdrive_retry_queue 
@@ -102,13 +101,6 @@ def init_db():
         conn.commit()
     finally:
         conn.close()
-
-    # Purge aria2 stopped results from memory
-    try:
-        call_aria2_rpc("aria2.purgeDownloadResult", [])
-        call_aria2_rpc("aria2.saveSession", [])
-    except Exception:
-        pass
 
     try:
         if os.path.exists("/downloads/download"):
@@ -121,6 +113,12 @@ def init_db():
         cleanup_bogus_files_on_disk()
     except Exception as e:
         print(f"Error running cleanup_bogus_files_on_disk: {e}")
+
+    # Remove phantom completed history records whose files do not exist on disk
+    try:
+        purge_phantom_completed_history()
+    except Exception as e:
+        print(f"Error running purge_phantom_completed_history: {e}")
 
     # Automatically scan existing downloaded files on disk once if needed
     try:
@@ -159,6 +157,49 @@ def cleanup_bogus_files_on_disk():
                         print(f"[Cleanup] Error checking {full_path}: {fe}")
     except Exception as e:
         print(f"[Cleanup] Error in cleanup_bogus_files_on_disk: {e}")
+
+def purge_phantom_completed_history():
+    """Verifies that all complete items in download_history have real files on disk.
+    Removes any phantom records and resets their queue status to pending."""
+    base_dir = "/downloads"
+    if not os.path.exists(base_dir):
+        return
+
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT gid, name, files_json FROM download_history WHERE status = 'complete'")
+        rows = cursor.fetchall()
+        for r in rows:
+            gid = r["gid"]
+            name = r["name"]
+            files = json.loads(r["files_json"]) if r["files_json"] else []
+            exists = False
+            for f in files:
+                p = f.get("path")
+                if p and os.path.exists(p) and os.path.getsize(p) >= 5 * 1024 * 1024:
+                    exists = True
+                    break
+            if not exists:
+                for root, dirs, fnames in os.walk(base_dir):
+                    if name in fnames:
+                        full_p = os.path.join(root, name)
+                        if os.path.getsize(full_p) >= 5 * 1024 * 1024:
+                            exists = True
+                            break
+            if not exists:
+                print(f"[Self-Healing] Removing phantom history record: {name} (GID: {gid})")
+                cursor.execute("DELETE FROM download_history WHERE gid = ?", (gid,))
+                cursor.execute("""
+                    UPDATE gdrive_retry_queue 
+                    SET status = 'pending', error = 'Google Drive Quota Exceeded (Chờ mở lại lượt tải)' 
+                    WHERE (filename = ? OR filename LIKE ?) AND status = 'completed'
+                """, (name, f"%{name}%"))
+        conn.commit()
+    except Exception as e:
+        print(f"Error in purge_phantom_completed_history: {e}")
+    finally:
+        conn.close()
 
 def sync_existing_files_to_history():
     """Scans download directories on disk and automatically adds any completed files to download_history if not already present or dismissed."""
@@ -226,6 +267,10 @@ def sync_existing_files_to_history():
                         ) VALUES (?, ?, ?, ?, 'complete', '', '', ?, ?, '{}')
                     ''', (gid, file, file_size, file_size, mtime, files_json))
                     existing_names.add(file)
+                    try:
+                        cursor.execute("UPDATE gdrive_retry_queue SET status = 'completed', error = NULL WHERE filename = ? OR filename LIKE ?", (file, f"%{file}%"))
+                    except Exception:
+                        pass
                 except Exception as e:
                     print(f"Error indexing file {full_path}: {e}")
         conn.commit()
@@ -294,15 +339,10 @@ def fetch_history():
                 "name": r["name"],
                 "totalLength": str(r["total_length"]),
                 "completedLength": str(r["completed_length"]),
-                "total_length": r["total_length"],
-                "completed_length": r["completed_length"],
                 "status": r["status"],
                 "errorCode": r["error_code"],
                 "errorMessage": r["error_message"],
-                "error_code": r["error_code"],
-                "error_message": r["error_message"],
                 "completedTime": r["completed_time"],
-                "completed_time": r["completed_time"],
                 "files": files,
                 "bittorrent": bittorrent,
                 "files_json": r["files_json"],
@@ -315,7 +355,7 @@ def fetch_history():
 def delete_history_record(gid):
     # Add to blocklist FIRST to prevent background poller race condition
     with _deleted_gids_lock:
-        _deleted_gids.add(gid)
+        _deleted_gids[gid] = time.time()
 
     # Try forceRemove first (handles active/waiting/paused tasks)
     result = call_aria2_rpc("aria2.forceRemove", [gid])
@@ -351,9 +391,10 @@ def clear_history():
         cursor = conn.cursor()
         cursor.execute('SELECT gid, name FROM download_history')
         rows = cursor.fetchall()
+        now = time.time()
         with _deleted_gids_lock:
             for r in rows:
-                _deleted_gids.add(r["gid"])
+                _deleted_gids[r["gid"]] = now
                 cursor.execute('INSERT OR IGNORE INTO dismissed_history (gid, name) VALUES (?, ?)', (r["gid"], r["name"]))
         cursor.execute('DELETE FROM download_history')
         conn.commit()
@@ -403,11 +444,14 @@ def upsert_history_records(tasks):
             # Skip GIDs that have been explicitly deleted by the user
             with _deleted_gids_lock:
                 if gid in _deleted_gids:
-                    continue
+                    if now - _deleted_gids[gid] < _DELETED_GID_TTL:
+                        continue
+                    else:
+                        del _deleted_gids[gid]
             cursor.execute('SELECT 1 FROM dismissed_history WHERE gid = ?', (gid,))
             if cursor.fetchone():
                 with _deleted_gids_lock:
-                    _deleted_gids.add(gid)
+                    _deleted_gids[gid] = now
                 continue
             name = get_task_name(task)
             # Skip metadata tasks from polluting history
@@ -424,6 +468,9 @@ def upsert_history_records(tasks):
                 completed_length = 0
                 
             status = task.get('status')
+            error_code = str(task.get('errorCode') or '')
+            error_message = str(task.get('errorMessage') or '')
+
             # If a task finished downloading (even if it is currently active / seeding), mark status as complete
             if total_length > 0 and completed_length >= total_length:
                 status = 'complete'
@@ -462,9 +509,9 @@ def upsert_history_records(tasks):
                 # Remove from download_history
                 cursor.execute("DELETE FROM download_history WHERE gid = ? OR name = ?", (gid, name))
                 # Reset queue item to pending
-                error_message = 'Google Drive trả về trang lỗi Quota HTML (2 KB) thay vì file video thực tế'
+                bogus_error_message = 'Google Drive trả về trang lỗi Quota HTML (2 KB) thay vì file video thực tế'
                 try:
-                    cursor.execute("UPDATE gdrive_retry_queue SET status = 'pending', error = ? WHERE filename = ? OR filename LIKE ?", (error_message, name, f"%{name}%"))
+                    cursor.execute("UPDATE gdrive_retry_queue SET status = 'pending', error = ? WHERE filename = ? OR filename LIKE ?", (bogus_error_message, name, f"%{name}%"))
                 except Exception:
                     pass
                 continue
@@ -491,6 +538,13 @@ def upsert_history_records(tasks):
                     bittorrent_json=excluded.bittorrent_json
             ''', (gid, name, total_length, completed_length, status, error_code, error_message, now, files_json, bittorrent_json))
             
+            # If complete, ensure it is removed from dismissed_history so it always displays
+            if status == 'complete':
+                try:
+                    cursor.execute("DELETE FROM dismissed_history WHERE gid = ? OR name = ?", (gid, name))
+                except Exception:
+                    pass
+
             # Check if newly completed
             if status == 'complete' and old_status != 'complete':
                 try:
@@ -565,53 +619,34 @@ def get_active_aria2_paths():
     active_paths = set()
     success = False
     try:
-        secret = os.environ.get('ARIA2_RPC_SECRET')
-        aria2_port = os.environ.get('ARIA2_RPC_PORT', '6800')
-        url = f"http://127.0.0.1:{aria2_port}/jsonrpc"
-        headers = {"Content-Type": "application/json"}
-        
-        methods = ["aria2.tellActive", "aria2.tellWaiting", "aria2.tellStopped"]
+        methods_params = [
+            ("aria2.tellActive", [["gid", "status", "files", "dir", "bittorrent"]]),
+            ("aria2.tellWaiting", [0, 1000, ["gid", "status", "files", "dir", "bittorrent"]]),
+            ("aria2.tellStopped", [0, 1000, ["gid", "status", "files", "dir", "bittorrent"]])
+        ]
         rpc_success_count = 0
-        for method in methods:
-            params = [f"token:{secret}"] if secret else []
-            if method in ["aria2.tellWaiting", "aria2.tellStopped"]:
-                params.extend([0, 1000])
-            params.append(["gid", "status", "files", "dir", "bittorrent"])
-            
-            payload = {
-                "jsonrpc": "2.0",
-                "id": "ariazero_cleanup_poller",
-                "method": method,
-                "params": params
-            }
-            req_data = json.dumps(payload).encode('utf-8')
-            req = urllib.request.Request(url, data=req_data, headers=headers, method="POST")
-            try:
-                with urllib.request.urlopen(req, timeout=5) as response:
-                    resp_data = json.loads(response.read().decode('utf-8'))
-                    if "result" in resp_data:
-                        tasks = resp_data["result"]
-                        rpc_success_count += 1
-                        if isinstance(tasks, list):
-                            for task in tasks:
-                                status = task.get("status")
-                                if status in ["active", "waiting", "paused", "error"]:
-                                    files = task.get("files", [])
-                                    for f in files:
-                                        path = f.get("path")
-                                        if path:
-                                            active_paths.add(os.path.realpath(path + ".aria2"))
-                                    bt = task.get("bittorrent", {})
-                                    if bt and isinstance(bt, dict):
-                                        info = bt.get("info", {})
-                                        name = info.get("name") if isinstance(info, dict) else None
-                                        directory = task.get("dir")
-                                        if name and directory:
-                                            active_paths.add(os.path.realpath(os.path.join(directory, name + ".aria2")))
-                                            active_paths.add(os.path.realpath(os.path.join(directory, name + ".torrent.aria2")))
-            except Exception:
-                pass
-        
+        for method, params in methods_params:
+            result = call_aria2_rpc(method, params)
+            if result and "result" in result:
+                tasks = result["result"]
+                rpc_success_count += 1
+                if isinstance(tasks, list):
+                    for task in tasks:
+                        status = task.get("status")
+                        if status in ["active", "waiting", "paused", "error"]:
+                            files = task.get("files", [])
+                            for f in files:
+                                path = f.get("path")
+                                if path:
+                                    active_paths.add(os.path.realpath(path + ".aria2"))
+                            bt = task.get("bittorrent", {})
+                            if bt and isinstance(bt, dict):
+                                info = bt.get("info", {})
+                                name = info.get("name") if isinstance(info, dict) else None
+                                directory = task.get("dir")
+                                if name and directory:
+                                    active_paths.add(os.path.realpath(os.path.join(directory, name + ".aria2")))
+                                    active_paths.add(os.path.realpath(os.path.join(directory, name + ".torrent.aria2")))
         if rpc_success_count > 0:
             success = True
     except Exception:
@@ -693,6 +728,11 @@ def cleanup_old_hash_jobs():
         ]
         for path in to_delete:
             del hash_jobs[path]
+    # Also cleanup expired _deleted_gids entries
+    with _deleted_gids_lock:
+        expired = [gid for gid, ts in _deleted_gids.items() if now - ts > _DELETED_GID_TTL]
+        for gid in expired:
+            del _deleted_gids[gid]
 
 # === Jackett Integration ===
 
@@ -700,6 +740,7 @@ JACKETT_API_BASE = "http://127.0.0.1:9117"
 JACKETT_CONFIG_PATH = "/config/jackett/ServerConfig.json"
 _trending_cache = {}
 _trending_cache_time = {}
+_trending_lock = threading.Lock()
 TRENDING_CACHE_TTL = 21600
 
 def trending_poller():
@@ -825,12 +866,12 @@ def fetch_omdb_metadata(title, year=None, media_type='movie', omdb_key=None):
     key_to_use = omdb_key or OMDB_API_KEY
     if not key_to_use: return {}
     cache_key = _get_omdb_cache_key(title, year, media_type)
+    conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute('SELECT genre, rt_score, plot, poster, cached_at FROM movie_metadata_cache WHERE search_key = ?', (cache_key,))
         row = cursor.fetchone()
-        conn.close()
         if row and (time.time() - row['cached_at']) < OMDB_CACHE_TTL:
             res = {}
             if row['genre']: res['genre'] = row['genre']
@@ -838,7 +879,12 @@ def fetch_omdb_metadata(title, year=None, media_type='movie', omdb_key=None):
             if row['plot']: res['plot'] = row['plot']
             if row['poster'] and row['poster'] != 'N/A': res['poster'] = row['poster']
             return res
-    except Exception: pass
+    except Exception:
+        pass
+    finally:
+        if conn:
+            conn.close()
+
     try:
         params = {'apikey': key_to_use, 't': title, 'type': media_type, 'plot': 'short'}
         if year: params['y'] = year
@@ -861,14 +907,18 @@ def fetch_omdb_metadata(title, year=None, media_type='movie', omdb_key=None):
     except Exception: return {}
 
 def _store_omdb_cache(cache_key, genre, rt_score, plot, poster):
+    conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute('''INSERT OR REPLACE INTO movie_metadata_cache (search_key, genre, rt_score, plot, poster, cached_at) VALUES (?, ?, ?, ?, ?, ?)''', 
                        (cache_key, genre, rt_score, plot, poster, int(time.time())))
         conn.commit()
-        conn.close()
-    except Exception: pass
+    except Exception:
+        pass
+    finally:
+        if conn:
+            conn.close()
 
 _omdb_executor = ThreadPoolExecutor(max_workers=5)
 
@@ -902,8 +952,9 @@ def get_trending(category="all", omdb_key=None, force_refresh=False):
     cache_key = category
     now = time.time()
 
-    if not force_refresh and cache_key in _trending_cache and (now - _trending_cache_time.get(cache_key, 0)) < TRENDING_CACHE_TTL:
-        return _trending_cache[cache_key]
+    with _trending_lock:
+        if not force_refresh and cache_key in _trending_cache and (now - _trending_cache_time.get(cache_key, 0)) < TRENDING_CACHE_TTL:
+            return _trending_cache[cache_key]
 
     results = []
 
@@ -984,8 +1035,9 @@ def get_trending(category="all", omdb_key=None, force_refresh=False):
     top_results = enrich_trending_with_metadata(top_results, category, omdb_key)
 
     result = {"results": top_results}
-    _trending_cache[cache_key] = result
-    _trending_cache_time[cache_key] = now
+    with _trending_lock:
+        _trending_cache[cache_key] = result
+        _trending_cache_time[cache_key] = now
 
     return result
 
@@ -1537,9 +1589,8 @@ def gdrive_queue_poller():
     time.sleep(15)
     while True:
         try:
-            items = get_gdrive_queue()
-            pending_items = [item for item in items if item.get("status") == "pending"]
-            for item in pending_items:
+            items = get_gdrive_queue()  # Already filtered WHERE status = 'pending'
+            for item in items:
                 qid = item["id"]
                 g_url = item["url"]
 
@@ -1948,7 +1999,8 @@ class DiskSpaceHandler(BaseHTTPRequestHandler):
                     # Normalizing path using realpath
                     real_path = os.path.realpath(path)
                     
-                    if not (real_path.startswith(downloads_dir + os.sep) or real_path == downloads_dir):
+                    # Security check: ensure path is strictly inside downloads_dir and NOT the downloads_dir itself
+                    if not real_path.startswith(downloads_dir + os.sep) or real_path == downloads_dir:
                         errors.append(f"Forbidden path: {path}")
                         continue
                         

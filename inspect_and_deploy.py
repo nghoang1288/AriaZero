@@ -1,9 +1,11 @@
 import paramiko
 import sys
+import os
 
-hostname = "192.168.50.226"
-username = "illusion88"
-password = "armageddon"
+hostname = os.environ.get("DEPLOY_HOST", "192.168.50.226")
+username = os.environ.get("DEPLOY_USER", "illusion88")
+password = os.environ.get("DEPLOY_PASSWORD", "armageddon")
+rpc_secret = os.environ.get("ARIA2_RPC_SECRET", "armageddon")
 
 def run_ssh_cmd(ssh, cmd):
     print(f"Executing: {cmd}")
@@ -49,7 +51,7 @@ try:
         "-p 6881:6881/udp "
         "-v /home/illusion88/aria2/config:/config "
         "-v /home/illusion88/aria2/downloads:/downloads "
-        "-e ARIA2_RPC_SECRET=armageddon "
+        f"-e ARIA2_RPC_SECRET={rpc_secret} "
         "--restart unless-stopped "
         "illusion1208/ariazero:latest"
     )

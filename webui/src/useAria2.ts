@@ -91,6 +91,9 @@ declare global {
   interface Window {
     AriaZeroServerConfig?: {
       rpcSecret?: string;
+      smbUser?: string;
+      smbPassword?: string;
+      rpcSecretRequired?: boolean;
     };
   }
 }
@@ -541,75 +544,91 @@ export function useAria2() {
     }
   }, [selectedGid, status, poll, scheduleNext]);
 
-  // User Actions (Promise-based)
-  const addUri = useCallback((uri: string, options?: Record<string, string>) => {
-    const id = `action_addUri_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  // Helper to create timeout-protected RPC promises to avoid memory leaks
+  const createRpcPromise = useCallback((id: string, sendFn: () => void) => {
     return new Promise<any>((resolve, reject) => {
-      pendingRequestsRef.current.set(id, { resolve, reject });
-      sendRpcRef.current('aria2.addUri', [[uri], options || {}], id);
+      const timer = setTimeout(() => {
+        if (pendingRequestsRef.current.has(id)) {
+          pendingRequestsRef.current.delete(id);
+          reject(new Error(`RPC request timed out (15s): ${id}`));
+        }
+      }, 15000);
+
+      pendingRequestsRef.current.set(id, {
+        resolve: (val) => {
+          clearTimeout(timer);
+          resolve(val);
+        },
+        reject: (err) => {
+          clearTimeout(timer);
+          reject(err);
+        }
+      });
+      sendFn();
     });
   }, []);
+
+  // User Actions (Promise-based with auto-cleanup timeout)
+  const addUri = useCallback((uri: string, options?: Record<string, string>) => {
+    const id = `action_addUri_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    return createRpcPromise(id, () => {
+      sendRpcRef.current('aria2.addUri', [[uri], options || {}], id);
+    });
+  }, [createRpcPromise]);
 
   const changeTaskOption = useCallback((gid: string, options: Record<string, string>) => {
     const id = `action_changeOption_${Date.now()}_${Math.random().toString(36).slice(2)}`;
-    return new Promise<any>((resolve, reject) => {
-      pendingRequestsRef.current.set(id, { resolve, reject });
+    return createRpcPromise(id, () => {
       sendRpcRef.current('aria2.changeOption', [gid, options], id);
     });
-  }, []);
+  }, [createRpcPromise]);
 
   const getTaskOptions = useCallback((gid: string) => {
     const id = `action_getOption_${Date.now()}_${Math.random().toString(36).slice(2)}`;
-    return new Promise<any>((resolve, reject) => {
-      pendingRequestsRef.current.set(id, { resolve, reject });
+    return createRpcPromise(id, () => {
       sendRpcRef.current('aria2.getOption', [gid], id);
     });
-  }, []);
+  }, [createRpcPromise]);
 
   const addTorrent = useCallback((base64: string) => {
     const id = `action_addTorrent_${Date.now()}_${Math.random().toString(36).slice(2)}`;
-    return new Promise<any>((resolve, reject) => {
-      pendingRequestsRef.current.set(id, { resolve, reject });
+    return createRpcPromise(id, () => {
       sendRpcRef.current('aria2.addTorrent', [base64], id);
     });
-  }, []);
+  }, [createRpcPromise]);
 
   const pauseTask = useCallback((gid: string) => {
     const id = `action_pause_${Date.now()}_${Math.random().toString(36).slice(2)}`;
-    return new Promise<any>((resolve, reject) => {
-      pendingRequestsRef.current.set(id, { resolve, reject });
+    return createRpcPromise(id, () => {
       sendRpcRef.current('aria2.pause', [gid], id);
     });
-  }, []);
+  }, [createRpcPromise]);
 
   const resumeTask = useCallback((gid: string) => {
     const id = `action_unpause_${Date.now()}_${Math.random().toString(36).slice(2)}`;
-    return new Promise<any>((resolve, reject) => {
-      pendingRequestsRef.current.set(id, { resolve, reject });
+    return createRpcPromise(id, () => {
       sendRpcRef.current('aria2.unpause', [gid], id);
     });
-  }, []);
+  }, [createRpcPromise]);
 
   const removeTask = useCallback((gid: string, taskStatus: string) => {
     const id = `action_remove_${Date.now()}_${Math.random().toString(36).slice(2)}`;
-    return new Promise<any>((resolve, reject) => {
-      pendingRequestsRef.current.set(id, { resolve, reject });
+    return createRpcPromise(id, () => {
       if (taskStatus === 'active' || taskStatus === 'waiting' || taskStatus === 'paused') {
         sendRpcRef.current('aria2.forceRemove', [gid], id);
       } else {
         sendRpcRef.current('aria2.removeDownloadResult', [gid], id);
       }
     });
-  }, []);
+  }, [createRpcPromise]);
 
   const clearStopped = useCallback(() => {
     const id = `action_purge_${Date.now()}_${Math.random().toString(36).slice(2)}`;
     clearHistoryTasks();
-    return new Promise<any>((resolve, reject) => {
-      pendingRequestsRef.current.set(id, { resolve, reject });
+    return createRpcPromise(id, () => {
       sendRpcRef.current('aria2.purgeDownloadResult', [], id);
     });
-  }, [clearHistoryTasks]);
+  }, [clearHistoryTasks, createRpcPromise]);
 
   const handleAria2Notification = useCallback((msg: any) => {
     const method = msg.method as string;

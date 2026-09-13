@@ -52,7 +52,7 @@ export default function SearchTorrentsPage({ addUri, addTorrent, showToast }: Se
 
   // Helper to fetch authorization header
   const getHeaders = useCallback(() => {
-    const secret = (window as any).AriaZeroServerConfig?.rpcSecret || '';
+    const secret = window.AriaZeroServerConfig?.rpcSecret || '';
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
     };

@@ -67,23 +67,30 @@ fi
 
 
 # Ensure permissions on configuration and downloads folders
-chmod -R 777 "$DOWNLOAD_DIR"
+chmod -R 755 "$DOWNLOAD_DIR"
+find "$DOWNLOAD_DIR" -type f -exec chmod 644 {} + 2>/dev/null || true
 chmod 755 "$CONF_DIR"
 chmod 644 "$CONF_FILE" "$SESSION_FILE" 2>/dev/null || true
 
-# Generate config.js for AriaZero containing the RPC Secret and SMB credentials
+RPC_REQUIRED="false"
+if [ -n "$ARIA2_RPC_SECRET" ]; then
+  RPC_REQUIRED="true"
+fi
+
+# Generate config.js for AriaZero
 cat <<EOF > /var/www/html/config.js
 window.AriaZeroServerConfig = {
   rpcSecret: "${ARIA2_RPC_SECRET}",
   smbUser: "${SMB_USER:-admin}",
-  smbPassword: "${SMB_PASSWORD:-123456}"
+  smbPassword: "${SMB_PASSWORD:-123456}",
+  rpcSecretRequired: ${RPC_REQUIRED}
 };
 EOF
 
 # Optional HTTP Basic Auth for Nginx
 if [ -n "$BASIC_AUTH_USER" ] && [ -n "$BASIC_AUTH_PASSWORD" ]; then
     echo "Configuring Nginx HTTP Basic Auth for user $BASIC_AUTH_USER..."
-    python3 -c "import hashlib, base64; print('${BASIC_AUTH_USER}:{SHA}' + base64.b64encode(hashlib.sha1('${BASIC_AUTH_PASSWORD}'.encode('utf-8')).digest()).decode('utf-8'))" > /etc/nginx/.htpasswd
+    python3 -c "import hashlib, base64, sys; print(f'{sys.argv[1]}:{{SHA}}' + base64.b64encode(hashlib.sha1(sys.argv[2].encode('utf-8')).digest()).decode('utf-8'))" "$BASIC_AUTH_USER" "$BASIC_AUTH_PASSWORD" > /etc/nginx/.htpasswd
     sed -i '/auth_basic/d' /etc/nginx/sites-available/default
     sed -i '/server_name _;/a \    auth_basic "AriaZero Restricted Area";\n    auth_basic_user_file /etc/nginx/.htpasswd;' /etc/nginx/sites-available/default
 fi
@@ -198,7 +205,7 @@ opener = urllib.request.build_opener(cookie_handler)
 max_attempts = 15
 for attempt in range(max_attempts):
     try:
-        resp = opener.open("http://127.0.0.1/jackett/UI/Dashboard", timeout=3)
+        resp = opener.open("http://127.0.0.1:9117/jackett/UI/Dashboard", timeout=3)
         if resp.getcode() == 200:
             print("Jackett is up and running! Proceeding to setup indexers...")
             break
@@ -230,7 +237,7 @@ for idx in indexers:
         
     print(f"Configuring indexer: {idx}...")
     try:
-        url_get = f"http://127.0.0.1/jackett/api/v2.0/indexers/{idx}/config"
+        url_get = f"http://127.0.0.1:9117/jackett/api/v2.0/indexers/{idx}/config"
         req_get = urllib.request.Request(url_get, headers={"Accept": "application/json"})
         with opener.open(req_get, timeout=5) as resp:
             default_config = json.loads(resp.read().decode('utf-8'))
@@ -242,7 +249,7 @@ for idx in indexers:
                     field["value"] = "https://1337x.ws/"
                     print("Customized 1337x Site Link to https://1337x.ws/")
             
-        url_post = f"http://127.0.0.1/jackett/api/v2.0/indexers/{idx}/config"
+        url_post = f"http://127.0.0.1:9117/jackett/api/v2.0/indexers/{idx}/config"
         req_post = urllib.request.Request(
             url_post,
             data=json.dumps(default_config).encode('utf-8'),
