@@ -10,6 +10,8 @@ rpc_secret = os.environ.get("ARIA2_RPC_SECRET", "armageddon")
 def run_ssh_cmd(ssh, cmd):
     print(f"Executing: {cmd}")
     stdin, stdout, stderr = ssh.exec_command(cmd)
+    stdin.write(password + '\n')
+    stdin.flush()
     out = stdout.read().decode('utf-8', errors='ignore')
     err = stderr.read().decode('utf-8', errors='ignore')
     return out, err
@@ -23,26 +25,26 @@ try:
 
     # 1. Pull the latest image
     print("Pulling latest image from Docker Hub...")
-    out, err = run_ssh_cmd(ssh, "docker pull illusion1208/ariazero:latest")
+    out, err = run_ssh_cmd(ssh, "sudo -S docker -H tcp://127.0.0.1:2375 pull illusion1208/ariazero:latest")
     print(out)
 
     # 2. Check if container already exists
-    out, err = run_ssh_cmd(ssh, "docker ps -a --filter name=ariazero --format '{{.ID}}'")
-    container_ids = [c.strip() for c in out.strip().split('\n') if c.strip()]
+    out, err = run_ssh_cmd(ssh, "sudo -S docker -H tcp://127.0.0.1:2375 ps -a --filter name=ariazero --format '{{.ID}}'")
+    container_ids = [c.strip() for c in out.strip().split('\n') if c.strip() and not c.startswith("[sudo]")]
 
     if container_ids:
         container_id = container_ids[0]
         print(f"Stopping existing container {container_id}...")
-        run_ssh_cmd(ssh, f"docker stop {container_id}")
+        run_ssh_cmd(ssh, f"sudo -S docker -H tcp://127.0.0.1:2375 stop {container_id}")
         print(f"Removing existing container {container_id}...")
-        run_ssh_cmd(ssh, f"docker rm {container_id}")
+        run_ssh_cmd(ssh, f"sudo -S docker -H tcp://127.0.0.1:2375 rm {container_id}")
 
     # 3. Formulate the docker run command
     # WebUI on port 16980, RPC on port 16800, SMB on port 445
     # Config stored in /home/illusion88/aria2/config, downloads in /home/illusion88/aria2/downloads
     # Secret key set to 'armageddon'
     run_cmd = (
-        "docker run -d "
+        "sudo -S docker -H tcp://127.0.0.1:2375 run -d "
         "--name ariazero "
         "-p 16980:80 "
         "-p 16800:6800 "
