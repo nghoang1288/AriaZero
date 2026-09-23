@@ -827,11 +827,27 @@ function AppContent({
 
   // Retry logic
   const retryTask = useCallback(async (task: Aria2Task) => {
-    const url = task.infoHash 
+    const rawUrl = task.infoHash 
       ? `magnet:?xt=urn:btih:${task.infoHash}` 
       : (task.files?.[0]?.uris?.[0]?.uri || null);
       
-    if (url) {
+    if (rawUrl) {
+      const gdriveId = extractGdriveId(rawUrl);
+      const isGDrive = isGoogleDriveUrl(rawUrl) || Boolean(gdriveId);
+
+      // For Google Drive tasks, reconstruct canonical URL and re-resolve to get fresh direct download link
+      if (isGDrive && gdriveId) {
+        const canonicalUrl = `https://drive.google.com/file/d/${gdriveId}/view`;
+        try {
+          await removeTask(task.gid, task.status);
+        } catch (e) {
+          // Ignore errors - task may already be removed
+        }
+        await deleteHistoryTask(task.gid);
+        addUri(canonicalUrl);
+        return;
+      }
+
       const aria2Paths = getPathsToDelete(task).filter(p => p.endsWith('.aria2'));
       if (aria2Paths.length > 0) {
         try {
@@ -851,7 +867,7 @@ function AppContent({
         }
       }
 
-      addUri(url);
+      addUri(rawUrl);
       try {
         await removeTask(task.gid, task.status);
       } catch (e) {
@@ -871,7 +887,7 @@ function AppContent({
         message: 'Could not retrieve original download link for this task.'
       });
     }
-  }, [addUri, removeTask, showToast, getPathsToDelete, fetchDiskSpace, getApiUrl]);
+  }, [addUri, removeTask, deleteHistoryTask, showToast, getPathsToDelete, fetchDiskSpace, getApiUrl]);
 
   // Process aria2 events inside AppContent to access retryTask and play notification sound
   useEffect(() => {

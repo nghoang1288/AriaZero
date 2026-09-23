@@ -2,7 +2,7 @@ import paramiko
 import sys
 import os
 
-hostname = os.environ.get("DEPLOY_HOST", "192.168.50.226")
+hostname = os.environ.get("DEPLOY_HOST", "192.168.50.222")
 username = os.environ.get("DEPLOY_USER", "illusion88")
 password = os.environ.get("DEPLOY_PASSWORD", "armageddon")
 rpc_secret = os.environ.get("ARIA2_RPC_SECRET", "armageddon")

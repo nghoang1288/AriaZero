@@ -146,13 +146,16 @@ def cleanup_bogus_files_on_disk():
                                 os.remove(full_path)
                                 # Remove accompanying metadata files (posters, nfo, etc.)
                                 base_name = os.path.splitext(file)[0]
+                                meta_exts = {'.nfo', '.jpg', '.jpeg', '.png', '.srt', '.sub', '.idx'}
                                 for sibling in os.listdir(root):
                                     if sibling.startswith(base_name) and sibling != file:
-                                        try:
-                                            os.remove(os.path.join(root, sibling))
-                                            print(f"[Cleanup] Removing associated metadata: {sibling}")
-                                        except Exception:
-                                            pass
+                                        sib_ext = os.path.splitext(sibling)[1].lower()
+                                        if sib_ext in meta_exts:
+                                            try:
+                                                os.remove(os.path.join(root, sibling))
+                                                print(f"[Cleanup] Removing associated metadata: {sibling}")
+                                            except Exception:
+                                                pass
                     except Exception as fe:
                         print(f"[Cleanup] Error checking {full_path}: {fe}")
     except Exception as e:
@@ -493,12 +496,15 @@ def upsert_history_records(tasks):
                             print(f"[Aria2 Monitor] Removed bogus download file: {f_path}")
                             base_name = os.path.splitext(os.path.basename(f_path))[0]
                             p_dir = os.path.dirname(f_path)
+                            meta_exts = {'.nfo', '.jpg', '.jpeg', '.png', '.srt', '.sub', '.idx'}
                             for sib in os.listdir(p_dir):
                                 if sib.startswith(base_name) and sib != os.path.basename(f_path):
-                                    try:
-                                        os.remove(os.path.join(p_dir, sib))
-                                    except Exception:
-                                        pass
+                                    sib_ext = os.path.splitext(sib)[1].lower()
+                                    if sib_ext in meta_exts:
+                                        try:
+                                            os.remove(os.path.join(p_dir, sib))
+                                        except Exception:
+                                            pass
                         except Exception as err_rem:
                             print(f"Error removing bogus file: {err_rem}")
                     break
@@ -664,10 +670,31 @@ def cleanup_orphaned_aria2_files():
             if file.endswith(".aria2"):
                 file_path = os.path.realpath(os.path.join(root, file))
                 if file_path not in active_paths:
-                    try:
-                        os.remove(file_path)
-                    except Exception:
-                        pass
+                    target_file = file_path[:-6]
+                    if not os.path.exists(target_file):
+                        # Truly orphaned .aria2 control file without any target data file
+                        try:
+                            os.remove(file_path)
+                            print(f"[Cleanup] Cleaned up orphaned control file without data: {file_path}")
+                        except Exception:
+                            pass
+                    else:
+                        # Only delete .aria2 if the file is known to be completed in download_history
+                        target_name = os.path.basename(target_file)
+                        conn = get_db_connection()
+                        try:
+                            cursor = conn.cursor()
+                            cursor.execute("SELECT status FROM download_history WHERE name = ? AND status = 'complete'", (target_name,))
+                            if cursor.fetchone():
+                                try:
+                                    os.remove(file_path)
+                                    print(f"[Cleanup] Cleaned up leftover .aria2 for completed file: {file_path}")
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                        finally:
+                            conn.close()
 
 def background_poller():
     cleanup_counter = 0
