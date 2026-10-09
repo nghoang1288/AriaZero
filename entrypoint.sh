@@ -63,6 +63,20 @@ else
     sed -i 's/^auto-file-renaming=.*/auto-file-renaming=false/' "$CONF_FILE"
 fi
 
+# Ensure max-tries=10 to tolerate transient network errors
+if ! grep -q "^max-tries=" "$CONF_FILE"; then
+    echo "max-tries=10" >> "$CONF_FILE"
+else
+    sed -i 's/^max-tries=.*/max-tries=10/' "$CONF_FILE"
+fi
+
+# Ensure retry-wait=5 to wait between retries
+if ! grep -q "^retry-wait=" "$CONF_FILE"; then
+    echo "retry-wait=5" >> "$CONF_FILE"
+else
+    sed -i 's/^retry-wait=.*/retry-wait=5/' "$CONF_FILE"
+fi
+
 
 
 

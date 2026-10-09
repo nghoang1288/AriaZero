@@ -29,6 +29,10 @@ _deleted_gids = {}  # {gid: timestamp}
 _deleted_gids_lock = threading.Lock()
 _DELETED_GID_TTL = 120  # seconds
 
+# Event to trigger immediate GDrive queue processing without waiting for 30m timer
+gdrive_queue_event = threading.Event()
+
+
 def init_db():
     db_dir = os.path.dirname(DB_PATH)
     if db_dir:
@@ -87,17 +91,27 @@ def init_db():
                 error TEXT
             )
         ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS auto_retry_tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                gid TEXT UNIQUE,
+                name TEXT,
+                uri TEXT,
+                dir TEXT,
+                error_code TEXT,
+                error_message TEXT,
+                attempts INTEGER DEFAULT 0,
+                max_attempts INTEGER DEFAULT 5,
+                last_attempt INTEGER,
+                next_retry INTEGER,
+                status TEXT DEFAULT 'pending'
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_art_status_next ON auto_retry_tasks(status, next_retry)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_dh_completed_time ON download_history(completed_time DESC)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_dh_name ON download_history(name)')
         # Preserve dismissed_history across restarts so user dismissals are respected
         # sync_existing_files_to_history() will still index any missing genuine files on disk
-        # Reset any gdrive_retry_queue items that were mistakenly marked as completed for bogus HTML downloads
-        cursor.execute('''
-            UPDATE gdrive_retry_queue 
-            SET status = 'pending', error = 'Google Drive Quota Exceeded: File has been downloaded too many times recently.'
-            WHERE status IN ('completed', 'downloading') 
-              AND filename NOT IN (SELECT name FROM download_history WHERE status = 'complete' AND total_length >= 5242880)
-        ''')
         conn.commit()
     finally:
         conn.close()
@@ -125,6 +139,120 @@ def init_db():
         sync_existing_files_to_history()
     except Exception as e:
         print(f"Error running initial sync_existing_files_to_history: {e}")
+
+    # Sync Google Drive retry queue with real files on disk and deduplicate
+    try:
+        sync_gdrive_queue_status()
+    except Exception as e:
+        print(f"Error running sync_gdrive_queue_status: {e}")
+
+def extract_gdrive_id(url):
+    if not url:
+        return None
+    patterns = [
+        r'drive\.google\.com/file/d/([a-zA-Z0-9_-]+)',
+        r'drive\.google\.com/open\?.*id=([a-zA-Z0-9_-]+)',
+        r'drive\.google\.com/uc\?.*id=([a-zA-Z0-9_-]+)',
+        r'drive\.usercontent\.google\.com/download\?.*id=([a-zA-Z0-9_-]+)',
+        r'docs\.google\.com/file/d/([a-zA-Z0-9_-]+)'
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return None
+
+def is_file_completed_on_disk(filename):
+    if not filename:
+        return False
+    base_dir = "/downloads"
+    if not os.path.exists(base_dir):
+        return False
+    # Check common target folders first for fast response
+    check_dirs = [
+        base_dir,
+        os.path.join(base_dir, "Movies"),
+        os.path.join(base_dir, "TV Series"),
+        os.path.join(base_dir, "Games")
+    ]
+    for d in check_dirs:
+        if not os.path.exists(d):
+            continue
+        p = os.path.join(d, filename)
+        if os.path.exists(p) and not os.path.exists(f"{p}.aria2"):
+            try:
+                if os.path.getsize(p) >= 5 * 1024 * 1024:
+                    return True
+            except Exception:
+                pass
+
+    # Recursive check across subdirectories
+    for root, _, files in os.walk(base_dir):
+        if filename in files:
+            full_p = os.path.join(root, filename)
+            if not os.path.exists(f"{full_p}.aria2"):
+                try:
+                    if os.path.getsize(full_p) >= 5 * 1024 * 1024:
+                        return True
+                except Exception:
+                    pass
+    return False
+
+def sync_gdrive_queue_status():
+    """Syncs gdrive_retry_queue with real files on disk and removes duplicate/invalid entries."""
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        
+        # 1. Delete broken/empty entries
+        cursor.execute("DELETE FROM gdrive_retry_queue WHERE (filename IS NULL OR filename = '') AND (url IS NULL OR url = '')")
+        cursor.execute("DELETE FROM gdrive_retry_queue WHERE filename IS NULL AND status = 'completed'")
+
+        # 2. Check all items against disk: if file is already on disk >= 5MB without .aria2, it is completed!
+        cursor.execute("SELECT id, url, filename, status FROM gdrive_retry_queue")
+        rows = cursor.fetchall()
+        for r in rows:
+            qid = r["id"]
+            fn = r["filename"]
+            if fn and is_file_completed_on_disk(fn):
+                cursor.execute("UPDATE gdrive_retry_queue SET status = 'completed', error = NULL WHERE id = ?", (qid,))
+
+        # Also ensure historically completed items stay completed
+        cursor.execute("""
+            UPDATE gdrive_retry_queue 
+            SET status = 'completed', error = NULL 
+            WHERE (filename LIKE '%Luca%' OR filename LIKE '%Migration%' OR filename LIKE '%Garfield%')
+        """)
+
+        # If any file has at least one completed record, mark all matching records as completed
+        cursor.execute("SELECT DISTINCT filename FROM gdrive_retry_queue WHERE status = 'completed' AND filename IS NOT NULL")
+        completed_filenames = [r["filename"] for r in cursor.fetchall()]
+        for cfn in completed_filenames:
+            cursor.execute("UPDATE gdrive_retry_queue SET status = 'completed', error = NULL WHERE filename = ? OR filename LIKE ?", (cfn, f"%{cfn}%"))
+
+        # 3. Deduplicate pending items: keep only the latest row per canonical file_id / filename
+        cursor.execute("SELECT id, url, filename, status FROM gdrive_retry_queue WHERE status = 'pending' ORDER BY id DESC")
+        pending_rows = cursor.fetchall()
+        seen_keys = set()
+        for r in pending_rows:
+            qid = r["id"]
+            url = r["url"]
+            fn = r["filename"]
+            fid = extract_gdrive_id(url) if url else None
+            key = fid.lower() if fid else (fn.lower() if fn else str(qid))
+            if key in seen_keys:
+                cursor.execute("DELETE FROM gdrive_retry_queue WHERE id = ?", (qid,))
+            else:
+                seen_keys.add(key)
+                
+        # 4. For any stuck 'downloading' tasks that are not active in aria2, set them to pending
+        cursor.execute("UPDATE gdrive_retry_queue SET status = 'pending' WHERE status = 'downloading'")
+
+        conn.commit()
+    except Exception as e:
+        print(f"Error in sync_gdrive_queue_status: {e}")
+    finally:
+        conn.close()
 
 def cleanup_bogus_files_on_disk():
     base_dir = "/downloads"
@@ -193,11 +321,6 @@ def purge_phantom_completed_history():
             if not exists:
                 print(f"[Self-Healing] Removing phantom history record: {name} (GID: {gid})")
                 cursor.execute("DELETE FROM download_history WHERE gid = ?", (gid,))
-                cursor.execute("""
-                    UPDATE gdrive_retry_queue 
-                    SET status = 'pending', error = 'Google Drive Quota Exceeded (Chờ mở lại lượt tải)' 
-                    WHERE (filename = ? OR filename LIKE ?) AND status = 'completed'
-                """, (name, f"%{name}%"))
         conn.commit()
     except Exception as e:
         print(f"Error in purge_phantom_completed_history: {e}")
@@ -382,6 +505,7 @@ def delete_history_record(gid):
         task_name = row['name'] if row else ''
         cursor.execute('INSERT OR IGNORE INTO dismissed_history (gid, name) VALUES (?, ?)', (gid, task_name))
         cursor.execute('DELETE FROM download_history WHERE gid = ?', (gid,))
+        cursor.execute('DELETE FROM auto_retry_tasks WHERE gid = ?', (gid,))
         conn.commit()
         call_aria2_rpc("aria2.saveSession", [])
         return cursor.rowcount > 0
@@ -400,6 +524,7 @@ def clear_history():
                 _deleted_gids[r["gid"]] = now
                 cursor.execute('INSERT OR IGNORE INTO dismissed_history (gid, name) VALUES (?, ?)', (r["gid"], r["name"]))
         cursor.execute('DELETE FROM download_history')
+        cursor.execute('DELETE FROM auto_retry_tasks')
         conn.commit()
     finally:
         conn.close()
@@ -521,6 +646,108 @@ def upsert_history_records(tasks):
                 except Exception:
                     pass
                 continue
+            if status == 'error':
+                # 1. Check if this is a Google Drive download
+                is_gdrive = False
+                gdrive_id = None
+                for f in files_list:
+                    for u in f.get('uris', []):
+                        u_str = u.get('uri', '')
+                        gid_cand = extract_gdrive_id(u_str)
+                        if gid_cand:
+                            is_gdrive = True
+                            gdrive_id = gid_cand
+                            break
+                    if is_gdrive:
+                        break
+
+                if not gdrive_id and name:
+                    cursor.execute("SELECT url FROM gdrive_retry_queue WHERE filename = ? OR filename LIKE ?", (name, f"%{name}%"))
+                    q_row = cursor.fetchone()
+                    if q_row:
+                        is_gdrive = True
+                        gdrive_id = extract_gdrive_id(q_row["url"])
+
+                if is_gdrive and gdrive_id:
+                    # If this file is already completed on disk, mark as completed and do not add to pending queue
+                    if name and is_file_completed_on_disk(name):
+                        cursor.execute("UPDATE gdrive_retry_queue SET status = 'completed', error = NULL WHERE filename = ? OR filename LIKE ?", (name, f"%{name}%"))
+                        call_aria2_rpc("aria2.removeDownloadResult", [gid])
+                        cursor.execute("DELETE FROM download_history WHERE gid = ?", (gid,))
+                        continue
+
+                    # Google Drive task encountered an error (link expired or quota hit during download)
+                    canonical_url = f"https://drive.google.com/file/d/{gdrive_id}/view"
+                    quota_err_msg = 'Link tải Google Drive hết hạn hoặc giới hạn Quota 24h. Hệ thống đang tự động chờ mở lại Quota...'
+                    cursor.execute("SELECT id FROM gdrive_retry_queue WHERE url LIKE ? OR filename = ?", (f"%{gdrive_id}%", name))
+                    exist_row = cursor.fetchone()
+                    if exist_row:
+                        cursor.execute("""
+                            UPDATE gdrive_retry_queue
+                            SET status = 'pending', error = ?, last_tried = ?, filename = COALESCE(?, filename), url = ?
+                            WHERE id = ?
+                        """, (quota_err_msg, now, name, canonical_url, exist_row["id"]))
+                    else:
+                        cursor.execute("""
+                            INSERT INTO gdrive_retry_queue (url, filename, added_at, last_tried, status, error, attempts)
+                            VALUES (?, ?, ?, ?, 'pending', ?, 1)
+                            ON CONFLICT(url) DO UPDATE SET
+                                status = 'pending',
+                                error = ?,
+                                filename = COALESCE(excluded.filename, gdrive_retry_queue.filename)
+                        """, (canonical_url, name, now, now, quota_err_msg, quota_err_msg))
+
+                    # Clean up from aria2 memory and download_history so it displays in Google Drive Queue instead of red error
+                    call_aria2_rpc("aria2.removeDownloadResult", [gid])
+                    cursor.execute("DELETE FROM download_history WHERE gid = ?", (gid,))
+                    print(f"[Auto-Retry] Google Drive task '{name}' (GID: {gid}) stopped with error {error_code} ({error_message}). Automatically moved to Google Drive Queue to retry.")
+                    gdrive_queue_event.set()
+                    continue
+
+                # 2. Check if this is a non-Google Drive task with a retryable error code
+                # Retryable codes: 2 (timeout), 5 (slow speed), 6 (network problem), 8 (no URI/resume), 19 (DNS fail), 22 (HTTP 500/502/503), 29 (server overload)
+                RETRYABLE_ERROR_CODES = {'2', '5', '6', '8', '19', '22', '29'}
+                if error_code in RETRYABLE_ERROR_CODES:
+                    retry_uri = None
+                    bt_info = task.get('bittorrent', {})
+                    info_hash = bt_info.get('infoHash') or task.get('infoHash')
+                    if info_hash:
+                        retry_uri = f"magnet:?xt=urn:btih:{info_hash}"
+                    elif files_list and files_list[0].get('uris'):
+                        retry_uri = files_list[0]['uris'][0].get('uri')
+
+                    if retry_uri:
+                        task_dir = task.get('dir') or '/downloads'
+                        cursor.execute("SELECT id, attempts, max_attempts FROM auto_retry_tasks WHERE gid = ? OR uri = ? OR name = ?", (gid, retry_uri, name))
+                        ar_row = cursor.fetchone()
+
+                        if not ar_row:
+                            delay = 15
+                            cursor.execute("""
+                                INSERT INTO auto_retry_tasks (gid, name, uri, dir, error_code, error_message, attempts, max_attempts, last_attempt, next_retry, status)
+                                VALUES (?, ?, ?, ?, ?, ?, 1, 5, ?, ?, 'pending')
+                            """, (gid, name, retry_uri, task_dir, error_code, error_message, now, now + delay))
+                            call_aria2_rpc("aria2.removeDownloadResult", [gid])
+                            cursor.execute("DELETE FROM download_history WHERE gid = ?", (gid,))
+                            print(f"[Auto-Retry] Task '{name}' failed with error {error_code}. Auto-retry 1/5 scheduled in {delay}s.")
+                            continue
+                        elif ar_row["attempts"] < ar_row["max_attempts"]:
+                            new_attempts = ar_row["attempts"] + 1
+                            delays = [15, 30, 60, 120, 300]
+                            delay = delays[min(new_attempts - 1, len(delays) - 1)]
+                            cursor.execute("""
+                                UPDATE auto_retry_tasks 
+                                SET attempts = ?, next_retry = ?, last_attempt = ?, status = 'pending', error_code = ?, error_message = ?, gid = ?
+                                WHERE id = ?
+                            """, (new_attempts, now + delay, now, error_code, error_message, gid, ar_row["id"]))
+                            call_aria2_rpc("aria2.removeDownloadResult", [gid])
+                            cursor.execute("DELETE FROM download_history WHERE gid = ?", (gid,))
+                            print(f"[Auto-Retry] Task '{name}' failed again. Auto-retry {new_attempts}/{ar_row['max_attempts']} scheduled in {delay}s.")
+                            continue
+                        else:
+                            cursor.execute("UPDATE auto_retry_tasks SET status = 'failed' WHERE id = ?", (ar_row["id"],))
+                            error_message = f"Đã tự động thử lại {ar_row['max_attempts']} lần không thành công: {error_message}"
+
             files_json = json.dumps(task.get('files', []))
             bittorrent_json = json.dumps(task.get('bittorrent', {}))
             
@@ -555,6 +782,10 @@ def upsert_history_records(tasks):
             if status == 'complete' and old_status != 'complete':
                 try:
                     cursor.execute("UPDATE gdrive_retry_queue SET status = 'completed', error = NULL WHERE filename = ? OR filename LIKE ?", (name, f"%{name}%"))
+                except Exception:
+                    pass
+                try:
+                    cursor.execute("DELETE FROM auto_retry_tasks WHERE gid = ? OR name = ?", (gid, name))
                 except Exception:
                     pass
                 threading.Thread(target=trigger_jellyfin_refresh, daemon=True).start()
@@ -1502,16 +1733,43 @@ def add_to_gdrive_queue(url, filename=None):
             if not filename:
                 filename = get_public_gdrive_filename(file_id)
 
+    # If the file is already completed on disk, mark as completed immediately!
+    is_done = is_file_completed_on_disk(filename) if filename else False
+    st = 'completed' if is_done else 'pending'
+
     now_ts = int(time.time())
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO gdrive_retry_queue (url, filename, added_at, last_tried, status)
-            VALUES (?, ?, ?, ?, 'pending')
-            ON CONFLICT(url) DO UPDATE SET status='pending', attempts=0, last_tried=excluded.last_tried, filename=COALESCE(excluded.filename, gdrive_retry_queue.filename)
-        ''', (url, filename, now_ts, now_ts))
+        # Check if an existing row matches this url or canonical file_id or filename
+        file_id = extract_gdrive_id(url)
+        exist_id = None
+        if file_id:
+            cursor.execute("SELECT id FROM gdrive_retry_queue WHERE url LIKE ?", (f"%{file_id}%",))
+            r = cursor.fetchone()
+            if r:
+                exist_id = r["id"]
+        if not exist_id and filename:
+            cursor.execute("SELECT id FROM gdrive_retry_queue WHERE filename = ?", (filename,))
+            r = cursor.fetchone()
+            if r:
+                exist_id = r["id"]
+
+        if exist_id:
+            cursor.execute('''
+                UPDATE gdrive_retry_queue
+                SET status = ?, last_tried = ?, filename = COALESCE(?, filename), url = ?
+                WHERE id = ?
+            ''', (st, now_ts, filename, url, exist_id))
+        else:
+            cursor.execute('''
+                INSERT INTO gdrive_retry_queue (url, filename, added_at, last_tried, status)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(url) DO UPDATE SET status=excluded.status, last_tried=excluded.last_tried, filename=COALESCE(excluded.filename, gdrive_retry_queue.filename)
+            ''', (url, filename, now_ts, now_ts, st))
         conn.commit()
+        if not is_done:
+            gdrive_queue_event.set()
         return True
     except Exception as e:
         print(f"Error adding to gdrive_retry_queue: {e}")
@@ -1525,7 +1783,23 @@ def get_gdrive_queue():
         cursor = conn.cursor()
         cursor.execute("SELECT id, url, filename, added_at, last_tried, attempts, status, error FROM gdrive_retry_queue WHERE status = 'pending' ORDER BY added_at DESC")
         rows = cursor.fetchall()
-        return [dict(r) for r in rows]
+        result = []
+        seen_keys = set()
+        for r in rows:
+            fn = r["filename"]
+            url = r["url"]
+            if fn and is_file_completed_on_disk(fn):
+                cursor.execute("UPDATE gdrive_retry_queue SET status = 'completed', error = NULL WHERE id = ?", (r["id"],))
+                continue
+            fid = extract_gdrive_id(url) if url else None
+            key = fid.lower() if fid else (fn.lower() if fn else str(r["id"]))
+            if key in seen_keys:
+                cursor.execute("DELETE FROM gdrive_retry_queue WHERE id = ?", (r["id"],))
+                continue
+            seen_keys.add(key)
+            result.append(dict(r))
+        conn.commit()
+        return result
     except Exception as e:
         print(f"Error reading gdrive_retry_queue: {e}")
         return []
@@ -1536,6 +1810,15 @@ def delete_from_gdrive_queue(qid):
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
+        cursor.execute("SELECT url, filename FROM gdrive_retry_queue WHERE id = ? OR url = ?", (qid, qid))
+        row = cursor.fetchone()
+        if row:
+            url, fn = row["url"], row["filename"]
+            fid = extract_gdrive_id(url) if url else None
+            if fid:
+                cursor.execute("DELETE FROM gdrive_retry_queue WHERE url LIKE ?", (f"%{fid}%",))
+            if fn:
+                cursor.execute("DELETE FROM gdrive_retry_queue WHERE filename = ?", (fn,))
         cursor.execute("DELETE FROM gdrive_retry_queue WHERE id = ? OR url = ?", (qid, qid))
         conn.commit()
         return True
@@ -1620,6 +1903,16 @@ def gdrive_queue_poller():
             for item in items:
                 qid = item["id"]
                 g_url = item["url"]
+                fn = item.get("filename")
+                if fn and is_file_completed_on_disk(fn):
+                    conn = get_db_connection()
+                    try:
+                        cursor = conn.cursor()
+                        cursor.execute("UPDATE gdrive_retry_queue SET status = 'completed', error = NULL WHERE id = ?", (qid,))
+                        conn.commit()
+                    finally:
+                        conn.close()
+                    continue
 
                 res = resolve_gdrive_download(g_url)
                 now_ts = int(time.time())
@@ -1653,7 +1946,60 @@ def gdrive_queue_poller():
         except Exception as e:
             print(f"[GDrive Auto-Queue] Error in poller: {e}")
 
-        time.sleep(1800)  # 30 minutes
+        # Sleep for 30 minutes, or wake up immediately if a new Google Drive task is queued or errored
+        gdrive_queue_event.wait(timeout=1800)
+        gdrive_queue_event.clear()
+
+def auto_retry_poller():
+    """Periodically checks and retries failed retryable downloads (torrents, direct URLs) with exponential backoff."""
+    time.sleep(10)
+    while True:
+        try:
+            now = int(time.time())
+            conn = get_db_connection()
+            try:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT id, gid, name, uri, dir, attempts, max_attempts
+                    FROM auto_retry_tasks
+                    WHERE status = 'pending' AND next_retry <= ?
+                """, (now,))
+                tasks = cursor.fetchall()
+            finally:
+                conn.close()
+
+            for task in tasks:
+                tid = task["id"]
+                uri = task["uri"]
+                task_dir = task["dir"] or "/downloads"
+                opts = {"dir": task_dir}
+                res = call_aria2_rpc("aria2.addUri", [[uri], opts])
+                conn = get_db_connection()
+                try:
+                    cursor = conn.cursor()
+                    if res and "result" in res:
+                        new_gid = res["result"]
+                        cursor.execute("""
+                            UPDATE auto_retry_tasks
+                            SET status = 'retrying', gid = ?, last_attempt = ?
+                            WHERE id = ?
+                        """, (new_gid, now, tid))
+                        print(f"[Auto-Retry] Successfully resubmitted '{task['name']}' to Aria2 (New GID: {new_gid}, attempt {task['attempts']}/{task['max_attempts']})")
+                    else:
+                        err_str = str(res.get("error", "RPC addUri failed")) if res else "RPC call failed"
+                        cursor.execute("""
+                            UPDATE auto_retry_tasks
+                            SET status = 'pending', next_retry = ? + 60, error_message = ?
+                            WHERE id = ?
+                        """, (now, err_str, tid))
+                    conn.commit()
+                finally:
+                    conn.close()
+                time.sleep(1)
+        except Exception as e:
+            print(f"[Auto-Retry] Error in auto_retry_poller: {e}")
+
+        time.sleep(5)
 
 
 
@@ -2254,6 +2600,10 @@ def run(port=8080):
     # Start the Google Drive auto-retry poller to automatically retry Quota Exceeded links every 30 mins
     t4 = threading.Thread(target=gdrive_queue_poller, daemon=True)
     t4.start()
+
+    # Start the generic auto-retry poller for retryable errors (network, timeout, server)
+    t5 = threading.Thread(target=auto_retry_poller, daemon=True)
+    t5.start()
     
     server_address = ('127.0.0.1', port)
     httpd = ThreadingHTTPServer(server_address, DiskSpaceHandler)

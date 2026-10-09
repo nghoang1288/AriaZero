@@ -848,25 +848,7 @@ function AppContent({
         return;
       }
 
-      const aria2Paths = getPathsToDelete(task).filter(p => p.endsWith('.aria2'));
-      if (aria2Paths.length > 0) {
-        try {
-          const apiUrl = getApiUrl('delete-files');
-          const secret = window.AriaZeroServerConfig?.rpcSecret || '';
-          const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-          if (secret) {
-            headers['Authorization'] = `Bearer ${secret}`;
-          }
-          await fetch(apiUrl, {
-            method: 'POST',
-            headers,
-            body: JSON.stringify({ files: aria2Paths })
-          });
-        } catch (e) {
-          console.error('Failed to clean up .aria2 control file before retry:', e);
-        }
-      }
-
+      // Preserve .aria2 control files so Aria2 can resume downloading instead of starting from scratch
       addUri(rawUrl);
       try {
         await removeTask(task.gid, task.status);
