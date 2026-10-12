@@ -999,7 +999,7 @@ JACKETT_CONFIG_PATH = "/config/jackett/ServerConfig.json"
 _trending_cache = {}
 _trending_cache_time = {}
 _trending_lock = threading.Lock()
-TRENDING_CACHE_TTL = 21600
+TRENDING_CACHE_TTL = 3600
 
 def trending_poller():
     time.sleep(10)
@@ -1012,7 +1012,7 @@ def trending_poller():
             success = True
         except Exception:
             pass
-        time.sleep(21600 if success else 60)
+        time.sleep(3600 if success else 60)
 
 TRACKER_LIST_URLS = [
     "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt",
@@ -1065,23 +1065,81 @@ def search_jackett(query, categories=None, t="search"):
     except Exception:
         return {"error": "Search failed", "results": []}
 
-def fetch_apibay_top100(category_id):
-    url = f"https://apibay.org/precompiled/data_top100_{category_id}.json"
+def fetch_apibay_torrents(category_id):
+    """Fetch both 48h recent top and general top 100 from apibay with full metadata."""
+    urls = [
+        f"https://apibay.org/precompiled/data_top100_48h_{category_id}.json",
+        f"https://apibay.org/precompiled/data_top100_{category_id}.json"
+    ]
     headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            data = json.loads(resp.read().decode('utf-8'))
-        results = []
-        for item in data:
-            name = item.get("name", "")
-            info_hash = item.get("info_hash", "")
-            if not name or not info_hash: continue
-            magnet = f"magnet:?xt=urn:btih:{info_hash}&dn={quote(name)}"
-            results.append({"title": name, "size": int(item.get("size", 0)), "seeders": int(item.get("seeders", 0)), "magnetUri": magnet})
-        return results
-    except Exception:
-        return []
+    seen_hashes = set()
+    results = []
+
+    for url in urls:
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read().decode('utf-8'))
+            for item in data:
+                name = item.get("name", "")
+                info_hash = item.get("info_hash", "")
+                if not name or not info_hash:
+                    continue
+                ih_upper = info_hash.upper()
+                if ih_upper in seen_hashes:
+                    continue
+                seen_hashes.add(ih_upper)
+                magnet = f"magnet:?xt=urn:btih:{info_hash}&dn={quote(name)}"
+                added = int(item.get("added", 0))
+                seeders = int(item.get("seeders", 0))
+                leechers = int(item.get("leechers", 0))
+                pub_date = time.strftime('%a, %d %b %Y %H:%M:%S GMT', time.gmtime(added)) if added > 0 else ""
+                results.append({
+                    "title": name,
+                    "size": int(item.get("size", 0)),
+                    "seeders": seeders,
+                    "leechers": leechers,
+                    "magnetUri": magnet,
+                    "tracker": "ThePirateBay",
+                    "publishDate": pub_date,
+                    "added": added,
+                    "category": str(item.get("category", category_id))
+                })
+        except Exception:
+            continue
+    return results
+
+def fetch_apibay_top100(category_id):
+    return fetch_apibay_torrents(category_id)
+
+def calculate_trending_score(item, now):
+    title = item.get("title", "")
+    seeders = max(0, int(item.get("seeders", 0)))
+    leechers = max(0, int(item.get("leechers", 0)))
+    added = int(item.get("added", 0))
+
+    if added > 0:
+        days_old = max(0.1, (now - added) / 86400.0)
+    else:
+        # Fallback to estimating days from release year in title
+        match = re.search(r'\b(19\d{2}|20\d{2})\b', title)
+        current_year = time.gmtime(now).tm_year
+        if match:
+            year = int(match.group(1))
+            if year >= current_year:
+                days_old = 7.0
+            elif year == current_year - 1:
+                days_old = 60.0
+            else:
+                days_old = min(3650.0, (current_year - year) * 365.0)
+        else:
+            days_old = 30.0
+
+    # Activity: Seeders + leechers (leechers weighted 1.5x as signal of active current demand)
+    activity = seeders + (leechers * 1.5)
+    # Recency decay formula: decays older torrents while heavily penalizing ancient ones
+    decay = 1.0 / ((days_old + 1.5) ** 0.65)
+    return activity * decay
 
 def get_movie_dedup_key(title):
     match = re.search(r'[\s\.\(\[-](19\d{2}|20\d{2})[\s\.\)\]-]', title)
@@ -1216,16 +1274,21 @@ def get_trending(category="all", omdb_key=None, force_refresh=False):
 
     results = []
 
-    # 1. Fetch from apibay.org (The Pirate Bay) directly for precise Top 100 lists
+    # 1. Fetch from apibay.org (The Pirate Bay) directly for precise Top 100 & 48h lists
     apibay_results = []
     if category == "movies":
-        apibay_results += fetch_apibay_top100("201")
-        apibay_results += fetch_apibay_top100("207")  # 207 is HD - Movies, 200 is All Video (includes TV)
+        apibay_results += fetch_apibay_torrents("207")  # 207 is HD - Movies
+        apibay_results += fetch_apibay_torrents("201")  # 201 is Movies
     elif category == "tv":
-        apibay_results += fetch_apibay_top100("208")
-        apibay_results += fetch_apibay_top100("205")
+        apibay_results += fetch_apibay_torrents("208")  # 208 is HD - TV
+        apibay_results += fetch_apibay_torrents("205")  # 205 is TV
     elif category == "games":
-        apibay_results += fetch_apibay_top100("400")
+        apibay_results += fetch_apibay_torrents("400")  # 400 is All Games
+        apibay_results += fetch_apibay_torrents("401")  # 401 is PC Games
+    elif category == "all":
+        apibay_results += fetch_apibay_torrents("207")
+        apibay_results += fetch_apibay_torrents("208")
+        apibay_results += fetch_apibay_torrents("400")
         
     results += apibay_results
 
@@ -1247,8 +1310,11 @@ def get_trending(category="all", omdb_key=None, force_refresh=False):
     if "results" in jackett_res:
         results += jackett_res["results"]
 
-    # 3. Sort by seeders descending FIRST so we always keep the highest seeded release
-    results.sort(key=lambda x: x.get("seeders", 0), reverse=True)
+    # 3. Calculate trending score and sort by trendingScore descending
+    for item in results:
+        item["trendingScore"] = round(calculate_trending_score(item, now), 1)
+
+    results.sort(key=lambda x: x.get("trendingScore", 0), reverse=True)
 
     # 4. Filter duplicates (by magnet, title, resolution key) and non-English releases
     seen_magnets = set()
@@ -1369,6 +1435,15 @@ def parse_torznab_xml(xml_data):
                 tracker = "Unknown"
 
             if title:
+                added = 0
+                if pub_date:
+                    try:
+                        import email.utils
+                        parsed_dt = email.utils.parsedate_to_datetime(pub_date)
+                        added = int(parsed_dt.timestamp())
+                    except Exception:
+                        pass
+
                 result_item = {
                     "title": title,
                     "size": size,
@@ -1378,6 +1453,7 @@ def parse_torznab_xml(xml_data):
                     "infoUrl": info_url,
                     "tracker": tracker,
                     "publishDate": pub_date,
+                    "added": added,
                     "category": category
                 }
                 if torrent_url and not magnet_uri:
@@ -2161,8 +2237,9 @@ class DiskSpaceHandler(BaseHTTPRequestHandler):
             try:
                 query_params = parse_qs(urlparse(self.path).query)
                 cat = query_params.get('cat', ['all'])[0]
+                force = query_params.get('force', ['false'])[0].lower() in ('true', '1')
                 omdb_key = self.headers.get('X-OMDb-API-Key') or self.headers.get('x-omdb-api-key') or OMDB_API_KEY
-                result = get_trending(cat, omdb_key)
+                result = get_trending(cat, omdb_key, force_refresh=force)
 
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json')

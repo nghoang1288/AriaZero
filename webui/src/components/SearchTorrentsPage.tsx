@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Search, Flame, Film, Tv, Gamepad, ShieldAlert, ArrowDown, ExternalLink } from 'lucide-react';
+import { Search, Flame, Film, Tv, Gamepad, ShieldAlert, ArrowDown, ExternalLink, RotateCw } from 'lucide-react';
 import { formatBytes } from '../useAria2';
 import { useApiUrl } from '../hooks/useApiUrl';
 import type { ToastMessage } from '../Toast';
@@ -83,9 +83,9 @@ export default function SearchTorrentsPage({ addUri, addTorrent, showToast }: Se
   }, [getApiUrl, getHeaders]);
 
   // Fetch trending torrents for a specific category
-  const fetchTrendingCategory = useCallback(async (cat: string) => {
+  const fetchTrendingCategory = useCallback(async (cat: string, force = false) => {
     try {
-      const url = `${getApiUrl('trending')}?cat=${cat}`;
+      const url = `${getApiUrl('trending')}?cat=${cat}${force ? '&force=true' : ''}`;
       const res = await fetch(url, { headers: getHeaders() });
       if (res.ok) {
         const data = await res.json();
@@ -98,12 +98,12 @@ export default function SearchTorrentsPage({ addUri, addTorrent, showToast }: Se
   }, [getApiUrl, getHeaders]);
 
   // Load trending data
-  const loadTrendingData = useCallback(async () => {
+  const loadTrendingData = useCallback(async (force = false) => {
     setIsLoadingTrending(true);
     const [movies, tv, games] = await Promise.all([
-      fetchTrendingCategory('movies'),
-      fetchTrendingCategory('tv'),
-      fetchTrendingCategory('games')
+      fetchTrendingCategory('movies', force),
+      fetchTrendingCategory('tv', force),
+      fetchTrendingCategory('games', force)
     ]);
     setTrendingMovies(movies.slice(0, 30));
     setTrendingTV(tv.slice(0, 30));
@@ -459,14 +459,29 @@ export default function SearchTorrentsPage({ addUri, addTorrent, showToast }: Se
       {/* Trending Suggestions / Top 100 */}
       {jackettStatus?.running && query.trim() === '' && (
         <div className="space-y-8">
-          <div className="flex items-center gap-2">
-            <Flame className="w-5 h-5 text-amber-500" />
-            <h2 className="text-base font-bold text-text-main tracking-tight">
-              Trending & Top Seeded Torrents
-            </h2>
-            <span className="bg-amber-500/10 text-amber-400 text-[10px] font-bold px-2 py-0.5 rounded border border-amber-500/10 font-mono">
-              Top 30
-            </span>
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <Flame className="w-5 h-5 text-amber-500" />
+              <h2 className="text-base font-bold text-text-main tracking-tight">
+                Trending & Hot Torrents
+              </h2>
+              <span className="bg-amber-500/10 text-amber-400 text-[10px] font-bold px-2 py-0.5 rounded border border-amber-500/10 font-mono">
+                Top 30
+              </span>
+              <span className="hidden sm:inline-block text-[11px] text-text-dim">
+                (Hot releases • Recency & Seeders)
+              </span>
+            </div>
+
+            <button
+              onClick={() => loadTrendingData(true)}
+              disabled={isLoadingTrending}
+              className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-semibold rounded-lg bg-page-bg/40 hover:bg-page-bg/80 text-text-dim hover:text-text-main border border-border-main/50 transition-colors disabled:opacity-50 cursor-pointer"
+              title="Force refresh trending torrents"
+            >
+              <RotateCw className={`w-3.5 h-3.5 ${isLoadingTrending ? 'animate-spin text-amber-400' : ''}`} />
+              <span>{isLoadingTrending ? 'Refreshing...' : 'Refresh'}</span>
+            </button>
           </div>
 
           {isLoadingTrending ? (
@@ -532,6 +547,20 @@ function getRtBgColor(score: string): string {
   if (num >= 75) return 'bg-emerald-500/10 border-emerald-500/20';
   if (num >= 60) return 'bg-amber-500/10 border-amber-500/20';
   return 'bg-red-500/10 border-red-500/20';
+}
+
+function formatRelativeTime(dateStr?: string): string | null {
+  if (!dateStr) return null;
+  const d = new Date(dateStr);
+  if (isNaN(d.getTime())) return null;
+  const diffSec = (Date.now() - d.getTime()) / 1000;
+  if (diffSec < 0) return 'Just now';
+  const diffHours = Math.floor(diffSec / 3600);
+  if (diffHours < 24) return `${Math.max(1, diffHours)}h ago`;
+  const diffDays = Math.floor(diffHours / 24);
+  if (diffDays < 30) return `${diffDays}d ago`;
+  if (diffDays < 365) return `${Math.floor(diffDays / 30)}mo ago`;
+  return `${Math.floor(diffDays / 365)}y ago`;
 }
 
 function TrendingSection({ title, icon, items, onDownload }: TrendingSectionProps) {
@@ -601,13 +630,21 @@ function TrendingSection({ title, icon, items, onDownload }: TrendingSectionProp
                   )}
                 </div>
 
-                {/* Size / Seeds / Tracker */}
+                {/* Size / Seeds / Time / Tracker */}
                 <div className="flex items-center gap-2 text-[10px] text-text-dim font-medium">
                   <span className="font-mono">{formatBytes(item.size)}</span>
                   <span className="text-border-main">•</span>
                   <span className="flex items-center gap-1 font-mono">
                     <span className="text-emerald-400 font-semibold">{item.seeders}</span> seeds
                   </span>
+                  {item.publishDate && formatRelativeTime(item.publishDate) && (
+                    <>
+                      <span className="text-border-main">•</span>
+                      <span className="text-amber-400/90 font-mono">
+                        {formatRelativeTime(item.publishDate)}
+                      </span>
+                    </>
+                  )}
                   <span className="text-border-main">•</span>
                   <span className="bg-page-bg/50 px-1.5 py-0.5 rounded text-[9px] font-bold text-text-main border border-border-main/30 uppercase font-sans">
                     {item.tracker}
